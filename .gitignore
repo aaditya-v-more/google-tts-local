@@ -1,0 +1,8 @@
+.private/
+assets/
+out/
+HANDOFF.md
+*.wav
+*.zvoice
+*.so
+*.tar.gz

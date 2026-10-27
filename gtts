@@ -1,0 +1,7 @@
+#!/bin/sh
+# Run the container with the voice data volume and the current folder mounted.
+# Paths you pass (--out, --pack) are relative to the current folder.
+exec docker run --rm -i \
+  -v "${GTTS_VOLUME:-gtts-data}:/data" \
+  -v "$PWD:/work" \
+  "${GTTS_IMAGE:-google-tts-local}" "$@"
