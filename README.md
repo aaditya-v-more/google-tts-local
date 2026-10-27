@@ -46,8 +46,8 @@ Download the image for your machine from
 and load it:
 
 ```sh
-docker load -i google-tts-local-0.1.0-arm64.tar.gz   # Apple Silicon
-docker load -i google-tts-local-0.1.0-amd64.tar.gz   # Intel
+docker load -i google-tts-local-0.2.0-arm64.tar.gz   # Apple Silicon
+docker load -i google-tts-local-0.2.0-amd64.tar.gz   # Intel
 ```
 
 Or build it yourself:
@@ -66,7 +66,7 @@ Then fetch the engine and voices:
 
 **The image contains none of Google's files.** `fetch` downloads Google's
 ChromeOS TTS package (about 110 MB) straight from Google's ChromeOS mirror,
-checks its SHA-256, and keeps only the engine and the English voices in a
+checks its SHA-256, and keeps the engine and all six language packs in a
 Docker volume called `gtts-data`. Google's terms apply to those files.
 
 `gtts` is a short script that runs the container with that volume and your
@@ -81,7 +81,7 @@ current folder mounted. Copy it somewhere on your `PATH` if you like.
 
 | Option | Default | |
 |---|---|---|
-| `--speaker` | `sfg` | Voice name, see below |
+| `--voice` | `en-us-x-multi/sfg` | Any id from `./gtts voices` |
 | `--rate` | `1.0` | Speed. `2.5` is two and a half times faster |
 | `--pitch` | `1.0` | |
 | `--out` | | WAV file, 24 kHz mono |
@@ -98,27 +98,39 @@ EOF
 
 ## Voices
 
-The English pack has 17 speakers: `hol`, `iob`, `iod`, `iof`, `iog`, `ioh`,
-`ioj`, `iol`, `iom`, `iop`, `jmp`, `sfg`, `tfe`, `tme`, `tpc`, `tpd`, `tpf`.
-`sfg` is the one Android uses as its default US English female voice.
+Google's package has six language packs, and each pack holds several
+speakers: 51 voices in all.
 
-Other languages in the package are Spanish, French, Hindi, Japanese and Dutch:
+| Pack | Language | Voices |
+|---|---|---|
+| `en-us-x-multi` | English (US) | 17, including `sfg` |
+| `es-es-x-multi` | Spanish (Spain) | 8 |
+| `fr-fr-x-multi` | French (France) | 7 |
+| `hi-in-x-multi` | Hindi | 6 |
+| `ja-jp-x-multi` | Japanese | 6 |
+| `nl-nl-x-multi` | Dutch | 7 |
+
+`./gtts voices` lists every id with its language and gender. A voice id is
+the pack and the speaker, such as `en-us-x-multi/sfg` or `fr-fr-x-multi/fra`:
 
 ```sh
-./gtts fetch --lang en-us --lang fr-fr
-./gtts speak --pack /data/voices/fr-fr-x-multi.zvoice --speaker fra --out bonjour.wav --text "Bonjour."
+./gtts voices
+./gtts speak --voice fr-fr-x-multi/fra --out bonjour.wav --text "Bonjour."
 ```
 
-An unknown `--speaker` prints the names that pack has.
+`sfg` is the one Android uses as its default US English female voice.
+To save space, fetch only the packs you want: `./gtts fetch --lang en-us --lang ja-jp`.
 
 ### A newer voice pack from your phone
 
 Android's Google TTS app updates its voice packs more often than ChromeOS.
-If you copy an `en-us-x-multi` `.zvoice` file off your phone, put it in the
-current folder and pass it with `--pack`:
+If you copy a `.zvoice` file off your phone, either pass it with `--pack`, or
+copy it into the `voices` folder of the `gtts-data` volume under a new name
+(for example `en-us-x-phone.zvoice`), where its speakers join the list as
+`en-us-x-phone/...`:
 
 ```sh
-./gtts speak --pack my-phone-pack.zvoice --out hello.wav --text "Hello."
+./gtts speak --pack my-phone-pack.zvoice --speaker sfg --out hello.wav --text "Hello."
 ```
 
 ## HTTP server
@@ -128,10 +140,18 @@ docker run -d --name gtts -p 127.0.0.1:5591:5591 -v gtts-data:/data google-tts-l
 curl -X POST localhost:5591/speak -d '{"text": "Hello.", "rate": 2}' -o hello.wav
 ```
 
-`POST /speak` takes `text`, and optionally `speaker`, `gender`, `rate` and
-`pitch`. It returns a WAV file, or raw 32-bit float samples at 24 kHz with
-`"format": "f32"`. `GET /health` answers once the voices are loaded.
-Requests are spoken one at a time.
+`GET /voices` lists every voice as `id`, `name`, `language` and `gender`.
+`POST /speak` takes `text`, and optionally `voice` (default
+`en-us-x-multi/sfg`), `rate` and `pitch`. It returns a WAV file, or raw 32-bit
+float samples at 24 kHz with `"format": "f32"`. `GET /health` answers once the
+server is up.
+
+The engine holds one pack per process, so the server runs a worker process for
+each pack the first time one of its voices is used, and stops it after ten idle
+minutes.
+
+[Earmark](https://github.com/aaditya-v-more/earmark), an EPUB reader for the
+Mac, lists these voices in its voice menu when this server is running.
 
 ## How it works
 
