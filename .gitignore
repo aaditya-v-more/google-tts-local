@@ -6,3 +6,4 @@ HANDOFF.md
 *.zvoice
 *.so
 *.tar.gz
+dist/
