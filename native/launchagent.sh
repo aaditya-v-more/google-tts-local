@@ -58,7 +58,7 @@ fi
 xml() { printf '%s' "$1" | sed 's/\&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g; s/'"'"'/\&apos;/g'; }
 LOG_DIR="$HOME/Library/Logs/google-tts-local"
 mkdir -p "$(dirname -- "$OUTPUT")"
-if [ "$MODE" = install ]; then mkdir -p "$LOG_DIR"; fi
+mkdir -p "$LOG_DIR"
 umask 077
 TEMP=$(mktemp "${OUTPUT}.XXXXXX")
 trap 'rm -f "$TEMP"' EXIT HUP INT TERM

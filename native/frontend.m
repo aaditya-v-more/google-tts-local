@@ -31,6 +31,7 @@ static NSString *engineExecutable;
 static NSString *findEngine(void);
 static NSArray<NSString *> *languages(void) { return @[@"en-us", @"es-es", @"fr-fr", @"hi-in", @"ja-jp", @"nl-nl"]; }
 static void raiseError(NSString *message) { @throw [NSException exceptionWithName:@"GTTS" reason:message userInfo:nil]; }
+static void raiseUsage(NSString *message) { @throw [NSException exceptionWithName:@"GTTSUsage" reason:message userInfo:nil]; }
 static NSData *jsonData(id value) {
     NSError *error = nil; NSData *data = [NSJSONSerialization dataWithJSONObject:value options:0 error:&error];
     if (!data) raiseError(error.localizedDescription ?: @"Could not encode JSON"); return data;
@@ -39,13 +40,14 @@ static id parseJSON(NSData *data) {
     NSError *error = nil; id value = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingFragmentsAllowed error:&error];
     if (!value) raiseError(error.localizedDescription ?: @"Invalid JSON"); return value;
 }
-static NSString *pathString(NSString *path) {
+static NSString *expandTilde(NSString *path) {
     if ([path isEqualToString:@"~"] || [path hasPrefix:@"~/"]) {
         NSString *home=getenv("HOME") ? [NSString stringWithUTF8String:getenv("HOME")] : NSHomeDirectory();
         path=[home stringByAppendingString:[path substringFromIndex:1]];
     }
-    return [path stringByStandardizingPath];
+    return path;
 }
+static NSString *pathString(NSString *path) { return [expandTilde(path) stringByStandardizingPath]; }
 static NSString *absolutePath(NSString *path) {
     if(![path isKindOfClass:[NSString class]] || !path.length)raiseError(@"Path cannot be empty");
     path=pathString(path);if(![path hasPrefix:@"/"])path=[[[NSFileManager defaultManager] currentDirectoryPath] stringByAppendingPathComponent:path];
@@ -65,8 +67,17 @@ static void writeAllFD(int fd, const void *bytes, size_t length) {
     while (length) { ssize_t n = write(fd, p, length); if (n < 0 && errno == EINTR) continue;
         if (n <= 0) raiseError([NSString stringWithFormat:@"Write failed: %s", strerror(errno)]); p += n; length -= (size_t)n; }
 }
-static void atomicWrite(NSString *path, NSData *data) {
-    NSString *parent = [pathString(path) stringByDeletingLastPathComponent]; if (!parent.length) parent = @".";
+// Path of the temporary output being written, removed if speak/batch is interrupted.
+static char *volatile pendingOutput;
+static void removePendingOutput(int sig) {
+    char *path=pendingOutput;if(path)unlink(path);
+    signal(sig,SIG_DFL);raise(sig);
+}
+static void atomicWriteWith(NSString *path, void (^write)(int fd)) {
+    // Resolve the path once, without collapsing "..", so the temporary file, the
+    // checks and the final rename all refer to the same directory.
+    path = expandTilde(path);
+    NSString *parent = [path stringByDeletingLastPathComponent]; if (!parent.length) parent = @".";
     struct stat existing;BOOL hasExisting=!lstat(path.fileSystemRepresentation,&existing);
     if (!safeFileTarget(path) || ![[NSFileManager defaultManager] fileExistsAtPath:parent])
         raiseError(@"Output must have an existing parent directory and not be a symlink or hard link");
@@ -78,21 +89,29 @@ static void atomicWrite(NSString *path, NSData *data) {
         if(unlink(temp))raiseError(@"Cannot prepare temporary output");
         fd=open(temp,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW,0666);
         if(fd<0 || (hasExisting && fchmod(fd,existing.st_mode & 07777)))raiseError(@"Cannot create output with the requested permissions");
-        writeAllFD(fd, data.bytes, data.length); if (close(fd)) { fd = -1; raiseError(@"Cannot close output"); } fd = -1;
+        pendingOutput=temp;
+        write(fd); if (close(fd)) { fd = -1; raiseError(@"Cannot close output"); } fd = -1;
         if (!safeFileTarget(path) || rename(temp, path.fileSystemRepresentation)) raiseError([NSString stringWithFormat:@"Cannot write %@: %s", path, strerror(errno)]);
-    } @finally { if (fd >= 0) close(fd); unlink(temp); free(temp); }
+    } @finally { pendingOutput=NULL; if (fd >= 0) close(fd); unlink(temp); free(temp); }
+}
+static void atomicWrite(NSString *path, NSData *data) {
+    atomicWriteWith(path, ^(int fd) { writeAllFD(fd, data.bytes, data.length); });
 }
 static void put16(uint8_t *p, uint16_t v) { p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); }
 static void put32(uint8_t *p, uint32_t v) { put16(p,(uint16_t)v); put16(p+2,(uint16_t)(v>>16)); }
-static NSData *wavData(NSData *audio) {
-    size_t samples = audio.length/sizeof(float); if (samples > (UINT32_MAX-36)/2) raiseError(@"Audio is too long for WAV");
-    NSMutableData *out = [NSMutableData dataWithLength:44+samples*2]; uint8_t *p = out.mutableBytes;
+static void wavHeader(uint8_t *p, size_t samples) {
     memcpy(p,"RIFF",4); put32(p+4,(uint32_t)(36+samples*2)); memcpy(p+8,"WAVEfmt ",8); put32(p+16,16);
     put16(p+20,1); put16(p+22,1); put32(p+24,24000); put32(p+28,48000); put16(p+32,2); put16(p+34,16);
     memcpy(p+36,"data",4); put32(p+40,(uint32_t)(samples*2));
-    const float *src = audio.bytes;
+}
+static void pcm16(uint8_t *p, const float *src, size_t samples) {
     for (size_t i=0; i<samples; ++i) { double n = (double)src[i]*32767.0;
-        int value = !isfinite(n) ? 0 : n >= 32767 ? 32767 : n <= -32768 ? -32768 : (int)n; put16(p+44+i*2,(uint16_t)(int16_t)value); }
+        int value = !isfinite(n) ? 0 : n >= 32767 ? 32767 : n <= -32768 ? -32768 : (int)n; put16(p+i*2,(uint16_t)(int16_t)value); }
+}
+static NSData *wavData(NSData *audio) {
+    size_t samples = audio.length/sizeof(float); if (samples > (UINT32_MAX-36)/2) raiseError(@"Audio is too long for WAV");
+    NSMutableData *out = [NSMutableData dataWithLength:44+samples*2]; uint8_t *p = out.mutableBytes;
+    wavHeader(p, samples); pcm16(p+44, audio.bytes, samples);
     return out;
 }
 static size_t curlWrite(char *ptr, size_t size, size_t count, void *opaque) { return fwrite(ptr, size, count, (FILE *)opaque) * size; }
@@ -117,6 +136,9 @@ static void download(NSString *url, NSString *destination, NSString *digest) {
     curl_easy_setopt(curl,CURLOPT_URL,url.UTF8String);curl_easy_setopt(curl,CURLOPT_FOLLOWLOCATION,1L);
     curl_easy_setopt(curl,CURLOPT_FAILONERROR,1L);curl_easy_setopt(curl,CURLOPT_WRITEFUNCTION,curlWrite);
     curl_easy_setopt(curl,CURLOPT_WRITEDATA,out);curl_easy_setopt(curl,CURLOPT_CONNECTTIMEOUT,30L);
+    curl_easy_setopt(curl,CURLOPT_PROTOCOLS_STR,"https");curl_easy_setopt(curl,CURLOPT_REDIR_PROTOCOLS_STR,"https");
+    curl_easy_setopt(curl,CURLOPT_LOW_SPEED_LIMIT,1024L);curl_easy_setopt(curl,CURLOPT_LOW_SPEED_TIME,60L);
+    curl_easy_setopt(curl,CURLOPT_MAXFILESIZE_LARGE,(curl_off_t)512*1024*1024);
     CURLcode rc=curl_easy_perform(curl);curl_easy_cleanup(curl);int closeError=fclose(out);
     if(rc!=CURLE_OK || closeError)raiseError([NSString stringWithFormat:@"Download failed: %s",curl_easy_strerror(rc)]);
     if(![[sha256File(destination) lowercaseString] isEqualToString:digest])raiseError([NSString stringWithFormat:@"SHA-256 mismatch for %@",url]);
@@ -225,8 +247,11 @@ static void fetch(NSString *dataDir, NSArray<NSString *> *langs) {
            ![[NSFileManager defaultManager] isReadableFileAtPath:shim])raiseError(@"Mach-O converter is missing; reinstall gtts.");
         setenv("PYTHONDONTWRITEBYTECODE","1",1);
         fprintf(stderr,"Converting downloaded engine and runtimes to Mach-O dylibs\n");
-        if(runProcess(@[@"/usr/bin/python3",converter,@"--data",dataDir,@"--output",converted,@"--shim",shim]))
-            raiseError(@"Mach-O conversion failed; the in-process and VM fallbacks remain available.");
+        if(runProcess(@[@"/usr/bin/python3",converter,@"--data",dataDir,@"--output",converted,@"--shim",shim])) {
+            fprintf(stderr,"Warning: Mach-O conversion failed; gtts will use its in-process or VM engine instead.\n");
+            fprintf(stderr,"Ready: %s/libchrometts.so and %s voices\n",dataDir.UTF8String,[[langs componentsJoinedByString:@", "] UTF8String]);
+            return;
+        }
         struct stat old; BOOL hadOld=!lstat(destination.fileSystemRepresentation,&old);
         if(hadOld && (!S_ISDIR(old.st_mode) || rename(destination.fileSystemRepresentation,backup.fileSystemRepresentation)))
             raiseError(@"Cannot replace the previous Mach-O conversion");
@@ -282,6 +307,7 @@ static void pipeTransfer(int fd,void *buffer,size_t length,BOOL writing,double d
 @property(nonatomic) NSTimeInterval used;
 - (instancetype)initWithPack:(NSString *)pack lib:(NSString *)lib verbose:(BOOL)verbose;
 - (NSData *)synthesize:(NSDictionary *)job;
+- (void)synthesize:(NSDictionary *)job sink:(void (^)(NSData *))sink;
 - (void)stop;
 @end
 static BOOL validSpeakerOrder(id order,id speakers) {
@@ -330,6 +356,12 @@ static BOOL validSpeakerOrder(id order,id speakers) {
     if(![result isKindOfClass:[NSDictionary class]]) raiseError(@"Invalid engine response");return result;
 }
 - (NSData *)synthesize:(NSDictionary *)job {
+    NSMutableData *audio=[NSMutableData data];
+    [self synthesize:job sink:^(NSData *chunk){
+        if(audio.length+chunk.length>128*1024*1024)raiseError(@"Audio is too long");[audio appendData:chunk];}];
+    return audio;
+}
+- (void)synthesize:(NSDictionary *)job sink:(void (^)(NSData *))sink {
     [_lock lock];
     BOOL validError=NO;
     @try {
@@ -337,12 +369,16 @@ static BOOL validSpeakerOrder(id order,id speakers) {
         if(_pid<=0)raiseError(@"Engine worker is unavailable");
         double deadline=workerDeadline();NSData *data=jsonData(job);uint8_t newline='\n';
         pipeTransfer(_inputFD,(void *)data.bytes,data.length,YES,deadline);pipeTransfer(_inputFD,&newline,1,YES,deadline);
-        NSDictionary *header=[self readHeader:deadline];
-        if(header[@"error"]) {validError=![header[@"broken"] boolValue];raiseError([header[@"error"] description]);}
-        NSNumber *length=header[@"bytes"]; if(![length isKindOfClass:[NSNumber class]] || length.unsignedLongLongValue>128*1024*1024 || length.unsignedLongLongValue%4) raiseError(@"Invalid audio length from worker");
-        NSMutableData *audio=[NSMutableData dataWithLength:length.unsignedIntegerValue];
-        pipeTransfer(_outputFD,audio.mutableBytes,audio.length,NO,deadline);
-        return audio;
+        for(;;) @autoreleasepool {
+            NSDictionary *header=[self readHeader:deadline];
+            deadline=workerDeadline(); // the timeout applies between segments, not to the whole text
+            if(header[@"error"]) {validError=![header[@"broken"] boolValue];raiseError([header[@"error"] description]);}
+            NSNumber *length=header[@"bytes"]; if(![length isKindOfClass:[NSNumber class]] || length.unsignedLongLongValue>128*1024*1024 || length.unsignedLongLongValue%4) raiseError(@"Invalid audio length from worker");
+            NSMutableData *chunk=[NSMutableData dataWithLength:length.unsignedIntegerValue];
+            pipeTransfer(_outputFD,chunk.mutableBytes,chunk.length,NO,deadline);
+            if(chunk.length)sink(chunk);
+            if(![header[@"more"] boolValue])return;
+        }
     } @catch(NSException *error) {if(!validError)[self stop];@throw error;}
       @finally { _used=[NSDate timeIntervalSinceReferenceDate]; [_lock unlock]; }
 }
@@ -374,6 +410,7 @@ static BOOL validSpeakerOrder(id order,id speakers) {
 - (NSArray<NSDictionary *> *)catalog;
 - (void)startReaper;
 - (NSData *)synthesize:(NSDictionary *)job defaults:(NSDictionary *)defaults;
+- (void)synthesize:(NSDictionary *)job defaults:(NSDictionary *)defaults sink:(void (^)(NSData *))sink;
 @end
 @implementation Voices
 - (instancetype)initWithLib:(NSString *)lib data:(NSString *)data pack:(NSString *)pack verbose:(BOOL)verbose {
@@ -439,6 +476,12 @@ static BOOL validSpeakerOrder(id order,id speakers) {
     });
 }
 - (NSData *)synthesize:(NSDictionary *)job defaults:(NSDictionary *)defaults {
+    NSMutableData *audio=[NSMutableData data];
+    [self synthesize:job defaults:defaults sink:^(NSData *chunk){
+        if(audio.length+chunk.length>128*1024*1024)raiseError(@"Audio is too long");[audio appendData:chunk];}];
+    return audio;
+}
+- (void)synthesize:(NSDictionary *)job defaults:(NSDictionary *)defaults sink:(void (^)(NSData *))sink {
     if(![job isKindOfClass:[NSDictionary class]]) raiseError(@"Expected a JSON object");
     id text=job[@"text"];if(![text isKindOfClass:[NSString class]]) raiseError(@"text must be a string");
     id voice=job[@"voice"] ?: defaults[@"voice"]; id speaker=job[@"speaker"];
@@ -455,13 +498,35 @@ static BOOL validSpeakerOrder(id order,id speakers) {
     id rate=job[@"rate"] ?: defaults[@"rate"] ?: @1, pitch=job[@"pitch"] ?: defaults[@"pitch"] ?: @1;
     if(![rate respondsToSelector:@selector(doubleValue)] || ![pitch respondsToSelector:@selector(doubleValue)] ||
        !isfinite([rate doubleValue]) || [rate doubleValue]<=0 || !isfinite([pitch doubleValue]) || [pitch doubleValue]<=0) raiseError(@"rate and pitch must be positive numbers");
-    return [worker synthesize:@{@"text":text,@"speaker":speaker,@"gender":defaults[@"gender"] ?: gender ?: @"",@"rate":@([rate doubleValue]),@"pitch":@([pitch doubleValue])}];
+    [worker synthesize:@{@"text":text,@"speaker":speaker,@"gender":defaults[@"gender"] ?: gender ?: @"",@"rate":@([rate doubleValue]),@"pitch":@([pitch doubleValue])} sink:sink];
 }
 @end
 
+// Speak straight into the output file: samples are converted and written as each
+// segment arrives, and the header is filled in once the length is known.
+static size_t writeSpeech(Voices *voices, NSDictionary *job, NSDictionary *defaults, NSString *path) {
+    __block size_t samples = 0;
+    atomicWriteWith(path, ^(int fd) {
+        uint8_t header[44] = {0}; writeAllFD(fd, header, sizeof header);
+        [voices synthesize:job defaults:defaults sink:^(NSData *chunk) {
+            size_t count = chunk.length/sizeof(float);
+            if (count > (UINT32_MAX-36)/2 - samples) raiseError(@"Audio is too long for WAV");
+            NSMutableData *pcm = [NSMutableData dataWithLength:count*2]; pcm16(pcm.mutableBytes, chunk.bytes, count);
+            writeAllFD(fd, pcm.bytes, pcm.length); samples += count;
+        }];
+        wavHeader(header, samples);
+        if (pwrite(fd, header, sizeof header, 0) != (ssize_t)sizeof header) raiseError(@"Cannot write WAV header");
+    });
+    return samples;
+}
+// Set by `gtts serve` when it runs with plain defaults. The token is also written to
+// serve-PORT.token in the data folder (mode 0600), so a client of the same user and
+// data folder can tell this server apart from anything else listening on the port.
+static NSString *serverToken;
 static void reply(int fd,int code,NSString *type,NSData *body) {
     const char *reason=code==200?"OK":code==400?"Bad Request":code==404?"Not Found":code==501?"Not Implemented":"Internal Server Error";
-    NSString *header=[NSString stringWithFormat:@"HTTP/1.1 %d %s\r\nContent-Type: %@\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n",code,reason,type,(unsigned long)body.length];
+    NSString *header=[NSString stringWithFormat:@"HTTP/1.1 %d %s\r\nContent-Type: %@\r\nContent-Length: %lu\r\nX-Gtts-Version: %s\r\n%@Connection: close\r\n\r\n",code,reason,type,(unsigned long)body.length,GTTS_VERSION,
+        serverToken ? [NSString stringWithFormat:@"X-Gtts-Token: %@\r\n",serverToken] : @""];
     const uint8_t *parts[]={ (const uint8_t *)header.UTF8String, body.bytes }; size_t lengths[]={strlen(header.UTF8String),body.length};
     for(int part=0;part<2;++part) {size_t offset=0;while(offset<lengths[part]) {ssize_t n=send(fd,parts[part]+offset,lengths[part]-offset,0);
         if(n<0 && errno==EINTR) continue;if(n<=0)return;offset+=(size_t)n;}}
@@ -511,7 +576,7 @@ static void *handleClient(void *opaque) {
             if([method isEqualToString:@"GET"] && [path isEqualToString:@"/health"]) reply(fd,200,@"application/json",[@"{\"ok\": true}" dataUsingEncoding:NSUTF8StringEncoding]);
             else if([method isEqualToString:@"GET"] && [path isEqualToString:@"/voices"]) reply(fd,200,@"application/json",jsonData([voices catalog]));
             else if([method isEqualToString:@"POST"] && [path isEqualToString:@"/speak"]) {
-                id job=parseJSON(request[@"body"]);NSMutableDictionary *httpDefaults=[defaults mutableCopy];[httpDefaults removeObjectForKey:@"voice"];[httpDefaults removeObjectForKey:@"speaker"];
+                id job=parseJSON(request[@"body"]);NSMutableDictionary *httpDefaults=[defaults mutableCopy];[httpDefaults removeObjectForKey:@"voice"];[httpDefaults removeObjectForKey:@"speaker"];[httpDefaults removeObjectForKey:@"gender"];
                 NSData *audio=[voices synthesize:job defaults:httpDefaults];
                 if([job[@"format"] isEqual:@"f32"])reply(fd,200,@"audio/L32; rate=24000",audio);
                 else reply(fd,200,@"audio/wav",wavData(audio));
@@ -530,7 +595,12 @@ static void serve(Voices *voices,NSDictionary *defaults,int port,NSString *host)
     if(bind(fd,(struct sockaddr *)&addr,sizeof addr) || listen(fd,16)) {close(fd);raiseError([NSString stringWithFormat:@"Cannot listen on %@:%d: %s",host,port,strerror(errno)]);}
     fprintf(stderr,"%lu voices from %lu packs. Listening on %s:%d\n",(unsigned long)catalog.count,(unsigned long)voices.packs.count,host.UTF8String,port);
     for(;;) {
-        int connection=accept(fd,NULL,NULL);if(connection<0){if(errno==EINTR)continue;close(fd);raiseError(@"Server accept failed");}
+        int connection=accept(fd,NULL,NULL);
+        if(connection<0) {
+            if(errno==EINTR || errno==ECONNABORTED || errno==EAGAIN)continue;
+            if(errno==EMFILE || errno==ENFILE || errno==ENOBUFS || errno==ENOMEM){usleep(100000);continue;}
+            close(fd);raiseError(@"Server accept failed");
+        }
         fcntl(connection,F_SETFD,FD_CLOEXEC);
         if(__atomic_fetch_add(&activeClients,1,__ATOMIC_ACQ_REL)>=16) {
             __atomic_sub_fetch(&activeClients,1,__ATOMIC_RELEASE);
@@ -550,7 +620,79 @@ static NSString *readStdin(void) {
     if(ferror(stdin))raiseError(@"Cannot read stdin"); NSString *text=[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     if(!text)raiseError(@"Text is not UTF-8");return text;
 }
+// Seconds rounded to two decimals, printed as 0.33 rather than 0.33000000000000002.
+static NSDecimalNumber *secondsValue(size_t samples) {
+    return [NSDecimalNumber decimalNumberWithString:[NSString stringWithFormat:@"%.2f",(double)samples/24000]
+                                             locale:@{NSLocaleDecimalSeparator:@"."}];
+}
 static void printJSON(id object) {NSData *data=jsonData(object);fwrite(data.bytes,1,data.length,stdout);fputc('\n',stdout);fflush(stdout);}
+// When this user's `gtts serve` is already running on the same data folder, short
+// speak and batch jobs are sent to it instead of starting an engine, which saves about
+// a third of a second of engine start-up per call. Anything unexpected falls back to
+// the local engine.
+static NSString *tokenPath(NSString *data, int port) {
+    return [data stringByAppendingPathComponent:[NSString stringWithFormat:@"serve-%d.token",port]];
+}
+static NSString *readServerToken(NSString *data, int port) {
+    NSString *path=tokenPath(data,port);struct stat st;
+    if(lstat(path.fileSystemRepresentation,&st) || !S_ISREG(st.st_mode) || st.st_uid!=geteuid() || (st.st_mode & 077) || st.st_size>256) return nil;
+    NSString *token=[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    token=[token stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return token.length==32 ? token : nil;
+}
+static void writeServerToken(NSString *data, int port) {
+    uint8_t random[16];arc4random_buf(random,sizeof random);NSMutableString *token=[NSMutableString string];
+    for(size_t i=0;i<sizeof random;++i)[token appendFormat:@"%02x",random[i]];
+    NSString *path=tokenPath(data,port);unlink(path.fileSystemRepresentation);
+    int fd=open(path.fileSystemRepresentation,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);
+    if(fd<0)return; // the server still works; clients just won't use it
+    NSData *bytes=[token dataUsingEncoding:NSUTF8StringEncoding];
+    BOOL ok=write(fd,bytes.bytes,bytes.length)==(ssize_t)bytes.length;close(fd);
+    if(ok)serverToken=token;else unlink(path.fileSystemRepresentation);
+}
+typedef struct { NSString *version, *token; } ServerHeaders;
+static size_t curlHeader(char *ptr, size_t size, size_t count, void *opaque) {
+    ServerHeaders *h=opaque;size_t length=size*count;
+    NSString *line=[[NSString alloc] initWithBytes:ptr length:length encoding:NSUTF8StringEncoding];NSRange colon=[line rangeOfString:@":"];
+    if(colon.location!=NSNotFound) {
+        NSString *name=[[line substringToIndex:colon.location] lowercaseString];
+        NSString *value=[[line substringFromIndex:colon.location+1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if([name isEqualToString:@"x-gtts-version"])h->version=value;else if([name isEqualToString:@"x-gtts-token"])h->token=value;
+    }
+    return length;
+}
+static size_t curlAppend(char *ptr, size_t size, size_t count, void *opaque) {
+    [(__bridge NSMutableData *)opaque appendBytes:ptr length:size*count]; return size*count;
+}
+// Returns the body only for a 200 reply from this build of gtts holding the expected token.
+static NSData *serverRequest(int port, NSString *token, NSString *path, NSData *body) {
+    NSMutableData *response=[NSMutableData data];CURL *curl=curl_easy_init();if(!curl)return nil;
+    ServerHeaders headers={nil,nil};long status=0;
+    NSString *url=[NSString stringWithFormat:@"http://127.0.0.1:%d%@",port,path];
+    curl_easy_setopt(curl,CURLOPT_URL,url.UTF8String);curl_easy_setopt(curl,CURLOPT_NOPROXY,"*");
+    curl_easy_setopt(curl,CURLOPT_CONNECTTIMEOUT_MS,200L);curl_easy_setopt(curl,CURLOPT_TIMEOUT,body ? 600L : 1L);
+    curl_easy_setopt(curl,CURLOPT_HEADERFUNCTION,curlHeader);curl_easy_setopt(curl,CURLOPT_HEADERDATA,&headers);
+    curl_easy_setopt(curl,CURLOPT_WRITEFUNCTION,curlAppend);curl_easy_setopt(curl,CURLOPT_WRITEDATA,(__bridge void *)response);
+    if(body){curl_easy_setopt(curl,CURLOPT_POSTFIELDS,body.bytes);curl_easy_setopt(curl,CURLOPT_POSTFIELDSIZE,(long)body.length);}
+    CURLcode rc=curl_easy_perform(curl);curl_easy_getinfo(curl,CURLINFO_RESPONSE_CODE,&status);curl_easy_cleanup(curl);
+    BOOL trusted=[headers.version isEqualToString:@GTTS_VERSION] && [headers.token isEqualToString:token];
+    return rc==CURLE_OK && status==200 && trusted ? response : nil;
+}
+static NSString *runningServer(NSString *data, int port) {
+    NSString *token=readServerToken(data,port);if(!token)return nil;
+    NSData *body=serverRequest(port,token,@"/health",nil);
+    id health=body ? [NSJSONSerialization JSONObjectWithData:body options:0 error:nil] : nil;
+    return [health isKindOfClass:[NSDictionary class]] && [health[@"ok"] isEqual:@YES] ? token : nil;
+}
+// Returns the number of samples written, or SIZE_MAX if the job should run locally.
+static size_t serverSpeech(int port, NSString *token, NSDictionary *job, NSDictionary *defaults, NSString *path) {
+    if(![job[@"text"] isKindOfClass:[NSString class]] || [job[@"text"] lengthOfBytesUsingEncoding:NSUTF8StringEncoding]>65536) return SIZE_MAX;
+    NSMutableDictionary *request=[NSMutableDictionary dictionaryWithObject:job[@"text"] forKey:@"text"];
+    for(NSString *key in @[@"voice",@"speaker",@"rate",@"pitch"]) if(job[key] ?: defaults[key]) request[key]=job[key] ?: defaults[key];
+    NSData *wav=serverRequest(port,token,@"/speak",jsonData(request));
+    if(!wav || wav.length<44 || memcmp(wav.bytes,"RIFF",4) || (wav.length-44)%2) return SIZE_MAX;
+    atomicWrite(path,wav);return (wav.length-44)/2;
+}
 static NSString *findEngine(void) {
     char name[PATH_MAX],resolved[PATH_MAX];uint32_t size=sizeof name;
     if(_NSGetExecutablePath(name,&size) || !realpath(name,resolved))raiseError(@"Cannot locate gtts executable");
@@ -574,8 +716,8 @@ static void usage(NSString *command) {
     }
     if([command isEqualToString:@"fetch"])printf("Usage: gtts fetch [--lang LANG ...] [--data-dir DIR]\nDownload the verified engine, voices, and runtimes, then convert the libraries to signed Mach-O.\nLanguages: en-us, es-es, fr-fr, hi-in, ja-jp, nl-nl (default: all).\n");
     else if([command isEqualToString:@"voices"])printf("Usage: gtts voices [--data-dir DIR] [--lib FILE] [--pack FILE] [--verbose]\nList voice IDs, languages, and genders. Run gtts fetch first.\n");
-    else if([command isEqualToString:@"speak"])printf("Usage: gtts speak --out FILE [--text TEXT] [voice options]\nRead UTF-8 text from stdin if --text is omitted and write a WAV file.\n");
-    else if([command isEqualToString:@"batch"])printf("Usage: gtts batch [voice options]\nRead one JSON object per line with text and out; voice, speaker, rate, and pitch are optional.\n");
+    else if([command isEqualToString:@"speak"])printf("Usage: gtts speak --out FILE [--text TEXT] [voice options]\nRead UTF-8 text from stdin if --text is omitted and write a WAV file.\nIf gtts serve is running on 127.0.0.1 (port 5591, or --port) with the default data, the text is sent there;\nset GTTS_NO_SERVER=1 to always start a local engine.\n");
+    else if([command isEqualToString:@"batch"])printf("Usage: gtts batch [voice options]\nRead one JSON object per line with text and out; voice, speaker, rate, and pitch are optional.\nIf gtts serve is running on 127.0.0.1 (port 5591, or --port) with the default data, the text is sent there;\nset GTTS_NO_SERVER=1 to always start a local engine.\n");
     else if([command isEqualToString:@"serve"])printf("Usage: gtts serve [--host IPv4] [--port PORT] [voice options]\nServe GET /health, GET /voices, and POST /speak (default 127.0.0.1:5591).\nPOST accepts text, voice, speaker, rate, pitch, and format f32 for raw float audio.\nHTTP voice and speaker come from the request, not CLI defaults.\n");
     else if([command isEqualToString:@"worker"])printf("Usage: gtts worker --pack FILE [--lib FILE] [--data-dir DIR] [--verbose]\nInternal protocol: JSON lines in; JSON headers and float32 audio out.\n");
     else printf("Usage: gtts %s [--lib FILE] [--data-dir DIR]\nInspect or initialize the guest engine without synthesis.\n",command.UTF8String);
@@ -603,14 +745,14 @@ int main(int argc,char **argv) {
                 if([arg isEqualToString:@"--verbose"]){options[@"verbose"]=@YES;continue;}
                 NSString *value=nil;NSRange equals=[arg rangeOfString:@"="];
                 if(equals.location!=NSNotFound && [arg hasPrefix:@"--"]) {value=[arg substringFromIndex:equals.location+1];arg=[arg substringToIndex:equals.location];}
-                else {if(i+1>=argc)raiseError([NSString stringWithFormat:@"Missing value for %@",arg]);value=[NSString stringWithUTF8String:argv[++i]];}
+                else {if(i+1>=argc)raiseUsage([NSString stringWithFormat:@"Missing value for %@",arg]);value=[NSString stringWithUTF8String:argv[++i]];}
                 if([arg isEqualToString:@"--data-dir"])data=value;
                 else if([arg isEqualToString:@"--lang"]) {if(![langs containsObject:value])[langs addObject:value];}
                 else if([@[@"--lib",@"--voice",@"--pack",@"--speaker",@"--gender",@"--text",@"--out",@"--host"] containsObject:arg]) {options[[arg substringFromIndex:2]]=value;}
                 else if([@[@"--rate",@"--pitch"] containsObject:arg]) {char *end;double n=strtod(value.UTF8String,&end);
-                    if(end==value.UTF8String || *end || !isfinite(n) || n<=0)raiseError([NSString stringWithFormat:@"Invalid %@: %@",arg,value]);options[[arg substringFromIndex:2]]=@(n);}
-                else if([arg isEqualToString:@"--port"]) {char *end;long n=strtol(value.UTF8String,&end,10);if(end==value.UTF8String||*end||n<1||n>65535)raiseError(@"Invalid port");options[@"port"]=@(n);}
-                else raiseError([NSString stringWithFormat:@"Unknown option: %@",arg]);
+                    if(end==value.UTF8String || *end || !isfinite(n) || n<=0)raiseUsage([NSString stringWithFormat:@"Invalid %@: %@",arg,value]);options[[arg substringFromIndex:2]]=@(n);}
+                else if([arg isEqualToString:@"--port"]) {char *end;long n=strtol(value.UTF8String,&end,10);if(end==value.UTF8String||*end||n<1||n>65535)raiseUsage(@"Invalid port");options[@"port"]=@(n);}
+                else raiseUsage([NSString stringWithFormat:@"Unknown option: %@",arg]);
             }
             if(help){usage(command);return 0;}if(!command){usage(nil);return 2;}
             if(!data && getenv("GTTS_DATA"))data=[NSString stringWithUTF8String:getenv("GTTS_DATA")];
@@ -634,21 +776,33 @@ int main(int argc,char **argv) {
                 char **execargs=calloc(args.count+1,sizeof *execargs);for(NSUInteger i=0;i<args.count;++i)execargs[i]=(char *)[args[i] fileSystemRepresentation];
                 execv(execargs[0],execargs);free(execargs);raiseError(@"Cannot start engine");
             }
-            Voices *voices=[[Voices alloc] initWithLib:lib data:data pack:options[@"pack"] verbose:[options[@"verbose"] boolValue]];
+            int port=[options[@"port"] intValue];
+            BOOL speaking=[command isEqualToString:@"speak"] || [command isEqualToString:@"batch"];
+            BOOL plain=!options[@"lib"] && !options[@"pack"] && !options[@"gender"];
+            NSString *token=speaking && plain && !getenv("GTTS_NO_SERVER") ? runningServer(data,port) : nil;
+            __block Voices *voices=token ? nil : [[Voices alloc] initWithLib:lib data:data pack:options[@"pack"] verbose:[options[@"verbose"] boolValue]];
+            size_t (^speakTo)(NSDictionary *, NSString *)=^size_t(NSDictionary *job, NSString *out) {
+                size_t samples=token ? serverSpeech(port,token,job,options,out) : SIZE_MAX;
+                if(samples!=SIZE_MAX)return samples;
+                if(!voices)voices=[[Voices alloc] initWithLib:lib data:data pack:options[@"pack"] verbose:[options[@"verbose"] boolValue]];
+                return writeSpeech(voices,job,options,out);
+            };
+            if(speaking){signal(SIGINT,removePendingOutput);signal(SIGTERM,removePendingOutput);signal(SIGHUP,removePendingOutput);}
             if([command isEqualToString:@"voices"]) {for(NSDictionary *v in [voices catalog])printf("%-24s %-6s %s\n",[v[@"id"] UTF8String],[v[@"language"] UTF8String],[v[@"gender"] UTF8String]);return 0;}
-            if([command isEqualToString:@"serve"]) {serve(voices,options,[options[@"port"] intValue],options[@"host"] ?: @"127.0.0.1");return 0;}
+            if([command isEqualToString:@"serve"]) {if(plain)writeServerToken(data,port);serve(voices,options,port,options[@"host"] ?: @"127.0.0.1");return 0;}
             if([command isEqualToString:@"batch"]) {
                 char *line=NULL;size_t capacity=0;ssize_t len;
                 @try {while((len=getline(&line,&capacity,stdin))>=0) {@autoreleasepool {
                     NSData *dataLine=[NSData dataWithBytes:line length:(NSUInteger)len];NSString *trim=[[[NSString alloc] initWithData:dataLine encoding:NSUTF8StringEncoding] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
                     if(!trim)raiseError(@"Batch input is not UTF-8");if(!trim.length)continue;id job=parseJSON(dataLine);if(![job isKindOfClass:[NSDictionary class]] || ![job[@"out"] isKindOfClass:[NSString class]])raiseError(@"batch requires a string out path");
-                    NSData *audio=[voices synthesize:job defaults:options];atomicWrite(job[@"out"],wavData(audio));
-                    printJSON(@{@"out":job[@"out"],@"seconds":@(round(((double)audio.length/4/24000)*100)/100)});
+                    size_t samples=speakTo(job,job[@"out"]);
+                    printJSON(@{@"out":job[@"out"],@"seconds":secondsValue(samples)});
                 }}} @finally {free(line);}return 0;
             }
             if(!options[@"out"])raiseError(@"speak needs --out");
-            NSString *text=options[@"text"] ?: readStdin();NSData *audio=[voices synthesize:@{@"text":text} defaults:options];atomicWrite(options[@"out"],wavData(audio));
-            printJSON(@{@"out":options[@"out"],@"seconds":@(round(((double)audio.length/4/24000)*100)/100)});return 0;
-        } @catch(NSException *error) {fprintf(stderr,"error: %s\n",(error.reason ?: @"Unknown error").UTF8String);return 1;}
+            NSString *text=options[@"text"] ?: readStdin();
+            size_t samples=speakTo(@{@"text":text},options[@"out"]);
+            printJSON(@{@"out":options[@"out"],@"seconds":secondsValue(samples)});return 0;
+        } @catch(NSException *error) {fprintf(stderr,"error: %s\n",(error.reason ?: @"Unknown error").UTF8String);return [error.name isEqualToString:@"GTTSUsage"] ? 2 : 1;}
     }
 }

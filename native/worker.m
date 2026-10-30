@@ -10,6 +10,16 @@ static BOOL sendJSON(FILE *out, NSDictionary *object) {
     NSData *data = [NSJSONSerialization dataWithJSONObject:object options:0 error:nil];
     return data && fwrite(data.bytes, 1, data.length, out) == data.length && fputc('\n', out) != EOF;
 }
+// Each finished segment goes out as {"bytes":N,"more":true} followed by N bytes of
+// float samples; the reply ends with a plain {"bytes":0} (or an error).
+static BOOL deliveryFailed;
+static int sendAudio(void *context, const float *samples, size_t count) {
+    FILE *out = context;
+    if (!count) return 0;
+    if (sendJSON(out, @{ @"bytes": @(count * sizeof(float)), @"more": @YES }) &&
+        fwrite(samples, sizeof(float), count, out) == count && !fflush(out)) return 0;
+    deliveryFailed = YES; return -1;
+}
 static BOOL validString(id value) {
     return [value isKindOfClass:[NSString class]] && [value lengthOfBytesUsingEncoding:NSUTF8StringEncoding] == strlen([value UTF8String]);
 }
@@ -36,7 +46,7 @@ int worker_run(Guest *guest, int protocol_fd, const char *pack, int verbose) {
             @autoreleasepool {
                 NSData *data = [NSData dataWithBytes:line length:(NSUInteger)length];
                 id job = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingFragmentsAllowed error:nil];
-                NSString *error = nil; float *audio = NULL; size_t count = 0;
+                NSString *error = nil; size_t count = 0;
                 if (![job isKindOfClass:[NSDictionary class]]) error = @"Expected a JSON object";
                 else if (!validString(job[@"text"]) || !validString(job[@"speaker"])) error = @"text and speaker must be strings without NUL characters";
                 else if (job[@"gender"] && !validString(job[@"gender"])) error = @"gender must be a string";
@@ -45,15 +55,14 @@ int worker_run(Guest *guest, int protocol_fd, const char *pack, int verbose) {
                 else {
                     double rate = job[@"rate"] ? [job[@"rate"] doubleValue] : 1.0;
                     double pitch = job[@"pitch"] ? [job[@"pitch"] doubleValue] : 1.0;
-                    if (speech_synth(&engine, [job[@"text"] UTF8String], [job[@"speaker"] UTF8String],
-                                     [job[@"gender"] UTF8String], rate, pitch, &audio, &count))
-                        error = [NSString stringWithUTF8String:engine.error];
+                    if (speech_synth_stream(&engine, [job[@"text"] UTF8String], [job[@"speaker"] UTF8String],
+                                            [job[@"gender"] UTF8String], rate, pitch, sendAudio, out, &count))
+                        error = [NSString stringWithUTF8String:engine.error] ?: @"Synthesis failed";
                 }
+                if (deliveryFailed) break; // the reader has gone away
                 BOOL ok;
                 if (error) ok = sendJSON(out, engine.broken ? @{ @"error": error, @"broken": @YES } : @{ @"error": error });
-                else ok = sendJSON(out, @{ @"bytes": @(count * sizeof(float)) }) &&
-                          (!count || fwrite(audio, sizeof(float), count, out) == count);
-                free(audio);
+                else ok = sendJSON(out, @{ @"bytes": @0 });
                 if (!ok || fflush(out) || engine.broken) break;
             }
         }

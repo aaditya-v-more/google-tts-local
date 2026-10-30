@@ -17,7 +17,16 @@
 typedef struct { uint8_t *data; size_t size, capacity; } Buffer;
 
 static int fail(SpeechEngine *e, const char *format, ...) {
-    va_list args; va_start(args, format); vsnprintf(e->error, sizeof e->error, format, args); va_end(args);
+    va_list args; va_start(args, format); int n = vsnprintf(e->error, sizeof e->error, format, args); va_end(args);
+    if (n >= (int)sizeof e->error) { // drop a final UTF-8 character that was cut short
+        size_t end = sizeof e->error - 1, start = end;
+        while (start && ((unsigned char)e->error[start - 1] & 0xc0) == 0x80) --start;
+        if (start) {
+            unsigned char lead = (unsigned char)e->error[start - 1];
+            size_t width = lead < 0x80 ? 1 : lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : 2;
+            if (start - 1 + width > end) e->error[start - 1] = 0;
+        }
+    }
     return -1;
 }
 static int append(Buffer *b, const void *data, size_t n) {
@@ -220,31 +229,50 @@ size_t speech_chunk_end(const char *text, size_t offset, size_t length) {
     return end;
 }
 
+// Long text is spoken in segments; each segment's audio goes to the sink as soon as
+// it is ready, so a chapter never has to be held in memory as a whole.
+int speech_synth_stream(SpeechEngine *e, const char *text, const char *speaker, const char *gender, double rate, double pitch,
+                        SpeechSink sink, void *context, size_t *count) {
+    size_t length = text ? strlen(text) : 0, offset = 0, total = 0;
+    *count = 0;
+    if (length > 16 * 1024 * 1024) return fail(e, "Text exceeds 16 MiB");
+    do {
+        size_t end = length <= 1024 ? length : speech_chunk_end(text, offset, length);
+        if (length > 1024 && end == offset) return fail(e, "Cannot split UTF-8 text");
+        float *chunk = NULL; size_t frames = 0; int status;
+        if (length <= 1024) status = speech_synth_part(e, text, speaker, gender, rate, pitch, &chunk, &frames);
+        else {
+            char *part = malloc(end - offset + 1);
+            if (!part) return fail(e, "Host memory exhausted");
+            memcpy(part, text + offset, end - offset); part[end - offset] = 0;
+            status = speech_synth_part(e, part, speaker, gender, rate, pitch, &chunk, &frames); free(part);
+        }
+        if (status) { free(chunk); return status; }
+        if (frames > (UINT32_MAX - 44) / sizeof(float) - total) { free(chunk); return fail(e, "Audio is too long"); }
+        int delivered = sink(context, chunk, frames); free(chunk);
+        if (delivered) return fail(e, "Cannot deliver audio");
+        total += frames; offset = end;
+    } while (offset < length);
+    *count = total; return 0;
+}
+
+typedef struct { float *data; size_t total, capacity; } AudioBuffer;
+static int append_audio(void *context, const float *samples, size_t frames) {
+    AudioBuffer *b = context;
+    if (b->total + frames > b->capacity) {
+        size_t next = b->capacity ? b->capacity : 16384; while (next < b->total + frames) next *= 2;
+        float *grown = realloc(b->data, next * sizeof(float)); if (!grown) return -1;
+        b->data = grown; b->capacity = next;
+    }
+    if (frames) memcpy(b->data + b->total, samples, frames * sizeof(float));
+    b->total += frames; return 0;
+}
 int speech_synth(SpeechEngine *e, const char *text, const char *speaker, const char *gender, double rate, double pitch,
                  float **audio, size_t *count) {
-    if (!text || strlen(text) <= 1024) return speech_synth_part(e, text, speaker, gender, rate, pitch, audio, count);
-    size_t length = strlen(text), offset = 0, total = 0, capacity = 0;
-    float *result = NULL; *audio = NULL; *count = 0;
-    if (length > 16 * 1024 * 1024) return fail(e, "Text exceeds 16 MiB");
-    while (offset < length) {
-        size_t end=speech_chunk_end(text,offset,length);
-        if (end == offset) { free(result); return fail(e, "Cannot split UTF-8 text"); }
-        char *part = malloc(end - offset + 1);
-        if (!part) { free(result); return fail(e, "Host memory exhausted"); }
-        memcpy(part, text + offset, end - offset); part[end - offset] = 0;
-        float *chunk = NULL; size_t frames = 0;
-        int status = speech_synth_part(e, part, speaker, gender, rate, pitch, &chunk, &frames); free(part);
-        if (status) { free(chunk); free(result); return status; }
-        if (frames > (UINT32_MAX - 44) / sizeof(float) - total) { free(chunk); free(result); return fail(e, "Audio is too long"); }
-        if (total + frames > capacity) {
-            size_t next = capacity ? capacity : 16384; while (next < total + frames) next *= 2;
-            float *grown = realloc(result, next * sizeof(float));
-            if (!grown) { free(chunk); free(result); return fail(e, "Host memory exhausted"); }
-            result = grown; capacity = next;
-        }
-        if (frames) memcpy(result + total, chunk, frames * sizeof(float)); free(chunk); total += frames; offset = end;
-    }
-    *audio = result; *count = total; return 0;
+    AudioBuffer b = {0};
+    int status = speech_synth_stream(e, text, speaker, gender, rate, pitch, append_audio, &b, count);
+    if (status) { free(b.data); *audio = NULL; *count = 0; return status; }
+    *audio = b.data; return 0;
 }
 void speech_close(SpeechEngine *e) {
     if (!e->guest) return;

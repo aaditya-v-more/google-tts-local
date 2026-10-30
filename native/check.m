@@ -71,10 +71,14 @@ int main(void) {
             NSFileHandle *writer=in.fileHandleForWriting,*reader=out.fileHandleForReading;
             NSDictionary *hello=readLine(reader);check([hello[@"speakers"][@"sfg"] isEqual:@"female"],@"Missing expected speaker");
             NSArray *speakerOrder=hello[@"speaker_order"];check([speakerOrder isKindOfClass:[NSArray class]] && speakerOrder.count==[hello[@"speakers"] count],@"Missing speaker order");
-            for(int i=0;i<8;++i){sendLine(writer,@{@"text":@"Hello there.",@"speaker":@"sfg"});NSDictionary *h=readLine(reader);
-                NSUInteger bytes=[h[@"bytes"] unsignedIntegerValue];check(bytes>1000 && bytes%4==0,@"Invalid worker audio");readN(reader,bytes);}
+            for(int i=0;i<8;++i){sendLine(writer,@{@"text":@"Hello there.",@"speaker":@"sfg"});NSUInteger total=0;NSDictionary *h;
+                do {h=readLine(reader);NSUInteger bytes=[h[@"bytes"] unsignedIntegerValue];check(!h[@"error"] && bytes%4==0,@"Invalid worker audio");
+                    readN(reader,bytes);total+=bytes;} while([h[@"more"] boolValue]);
+                check(total>1000,@"Invalid worker audio");}
             sendLine(writer,@{@"text":@"Hello",@"speaker":@"not-a-speaker"});check(readLine(reader)[@"error"]!=nil,@"Missing worker error");
-            sendLine(writer,@{@"text":@"Again.",@"speaker":@"sfg"});NSUInteger bytes=[readLine(reader)[@"bytes"] unsignedIntegerValue];check(bytes>1000,@"Worker did not recover");readN(reader,bytes);
+            sendLine(writer,@{@"text":@"Again.",@"speaker":@"sfg"});NSUInteger total=0;NSDictionary *h;
+            do {h=readLine(reader);NSUInteger bytes=[h[@"bytes"] unsignedIntegerValue];readN(reader,bytes);total+=bytes;} while([h[@"more"] boolValue]);
+            check(total>1000,@"Worker did not recover");
             [writer closeFile];[worker waitUntilExit];check(worker.terminationStatus==0,@"Worker failed to stop");
 
             NSMutableArray *batchArgs=[NSMutableArray arrayWithObject:@"batch"];[batchArgs addObjectsFromArray:base];

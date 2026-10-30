@@ -14,6 +14,3 @@ helper with Apple's custom x18 ABI and hypervisor entitlements. The helper is
 not notarised. The formula does not include or download Google engine or voice
 files at install time; run `gtts fetch` separately.
 ```
-
-The formula URL assumes the matching source tarball is later published as the
-`v0.4.0` release asset. No tap changes or release have been published here.

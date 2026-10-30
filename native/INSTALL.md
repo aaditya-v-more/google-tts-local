@@ -32,9 +32,17 @@ Other commands include `batch` (one JSON job per stdin line) and `serve` (HTTP
 `/health`, `/voices`, `/speak`). Use `gtts COMMAND --help` for options. The server
 binds to `127.0.0.1` by default, limits concurrent clients and request size, and
 has no authentication. `--host 0.0.0.0` explicitly exposes it on the network.
-Worker operations time out after 10 minutes; set `GTTS_WORKER_TIMEOUT_MS` to a
-value from 100 to 3600000 to change that limit. One response is limited to
-128 MiB of float audio (about 23 minutes); split longer text across requests.
+An engine worker that produces no audio for 10 minutes is stopped; set
+`GTTS_WORKER_TIMEOUT_MS` to a value from 100 to 3600000 to change that limit.
+`speak` and `batch` write audio to the file as it is produced, so long text needs
+little memory. One HTTP response is limited to 128 MiB of float audio (about 23
+minutes); split longer text across requests.
+
+When the service below is running on the same data folder, `speak` and `batch`
+send short text to it instead of starting an engine each time, which makes a
+short sentence take about 0.01 s instead of 0.3 s. They only use a server started
+by the same user without `--lib`, `--pack` or `--gender`, and fall back to a local
+engine on any problem. Set `GTTS_NO_SERVER=1` to always use a local engine.
 To run it as a user LaunchAgent:
 
 ```sh
