@@ -7,3 +7,12 @@ HANDOFF.md
 *.so
 *.tar.gz
 dist/
+native/ref/
+native/tmp/
+native/build/
+native/*.log
+native/TASK-*.md
+native/REPORT-*.md
+native/QUESTIONS.md
+native/watch.sh
+native/analyze-x18*.py
