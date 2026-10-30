@@ -10,6 +10,25 @@
 
 #include "guest.h"
 #include "guest_native.h"
+#include <mach-o/loader.h>
+
+// Bytes mapped for the image whose Mach-O header is at `header`, excluding __LINKEDIT.
+static uintptr_t mapped_end(const struct mach_header_64 *header) {
+    const uint8_t *command = (const uint8_t *)(header + 1);
+    uint64_t low = UINT64_MAX, high = 0;
+    for (uint32_t i = 0; i < header->ncmds; ++i) {
+        const struct load_command *lc = (const struct load_command *)command;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            if (strcmp(seg->segname, "__PAGEZERO") && strcmp(seg->segname, "__LINKEDIT") && seg->vmsize) {
+                if (seg->vmaddr < low) low = seg->vmaddr;
+                if (seg->vmaddr + seg->vmsize > high) high = seg->vmaddr + seg->vmsize;
+            }
+        }
+        command += lc->cmdsize;
+    }
+    return high > low ? (uintptr_t)header + (uintptr_t)(high - low) : (uintptr_t)header;
+}
 
 static const char *const sources[MAX_OBJECTS] = {
     "libchrometts.so", "runtime/libc++.so.1", "runtime/libc++abi.so.1",
@@ -134,6 +153,7 @@ int guest_macho_load(Guest *g) {
             return -2;
         }
         void *bases[MAX_OBJECTS] = {0}, *initializers[MAX_OBJECTS] = {0};
+        uintptr_t ends[MAX_OBJECTS] = {0};
         for (size_t i = 0; i < MAX_OBJECTS; ++i) {
             NSString *path = [dir stringByAppendingPathComponent:[NSString stringWithUTF8String:libraries[i]]];
             handles[i] = dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
@@ -149,6 +169,7 @@ int guest_macho_load(Guest *g) {
                 (uintptr_t)bases[i] != (uintptr_t)info.dli_fbase + 0x4000) {
                 close_handles(handles, shim); return -2;
             }
+            ends[i] = mapped_end((const struct mach_header_64 *)info.dli_fbase);
         }
         unsigned *tlsKey = dlsym(shim, "gtts_tls_key");
         void *entry = dlsym(shim, "native_guest_enter");
@@ -170,7 +191,7 @@ int guest_macho_load(Guest *g) {
             void *address = dlsym(shim, symbol);
             char *copy = strdup(name.UTF8String);
             if (!address || !copy) { free(copy); return -1; }
-            g->imports[index] = (Import){copy, (uintptr_t)address};
+            g->imports[index] = (Import){.name = copy, .address = (uintptr_t)address};
             ++g->import_count;
         }
         const char *override = getenv("GTTS_NATIVE_LIB");
@@ -180,6 +201,9 @@ int guest_macho_load(Guest *g) {
                 [data stringByAppendingPathComponent:[NSString stringWithUTF8String:sources[i]]];
             obj->path = strdup(path.fileSystemRepresentation);
             obj->base = bases[i]; obj->size = [meta[@"size"] unsignedLongLongValue];
+            // The recorded size is the ELF extent rounded up; dyld may place the next image
+            // inside that slack, so never claim more than this image actually maps.
+            if (ends[i] > (uintptr_t)obj->base && obj->size > ends[i] - (uintptr_t)obj->base) obj->size = ends[i] - (uintptr_t)obj->base;
             obj->macho_initializer = (uintptr_t)initializers[i];
             obj->phdr = (uintptr_t)obj->base + [meta[@"phdr"] unsignedLongLongValue];
             obj->phnum = [meta[@"phnum"] unsignedLongLongValue];

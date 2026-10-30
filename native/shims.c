@@ -46,7 +46,7 @@ static const struct { int host, linux; } errno_map[] = {
     {ECONNRESET,104}, {ENOBUFS,105}, {EISCONN,106}, {ENOTCONN,107},
     {ESHUTDOWN,108}, {ETOOMANYREFS,109}, {ETIMEDOUT,110}, {ECONNREFUSED,111},
     {EHOSTDOWN,112}, {EHOSTUNREACH,113}, {EALREADY,114}, {EINPROGRESS,115},
-    {ESTALE,116}, {EDQUOT,122}, {ECANCELED,125}, {EOWNERDEAD,130}, {ENOTRECOVERABLE,131}
+    {ESTALE,116}, {EDQUOT,122}, {EOPNOTSUPP,95}, {ENOATTR,61}, {ECANCELED,125}, {EOWNERDEAD,130}, {ENOTRECOVERABLE,131}
 };
 static int linux_errno(int value) {
     if(value>=0 && value<=34 && value!=EDEADLK)return value;
@@ -58,6 +58,10 @@ static int host_errno(int value) {
     for(size_t i=0;i<sizeof errno_map/sizeof errno_map[0];++i)if(errno_map[i].linux==value)return errno_map[i].host;
     return EIO;
 }
+// errno as handed to a Darwin call. Only a value the call actually changed is copied
+// back, so successful calls leave the guest's errno alone, as they would on Linux.
+static __thread int errno_entry;
+static void store_errno(Guest *g) { if (errno != errno_entry) *(int *)(uintptr_t)g->errno_slot = linux_errno(errno); }
 
 // glibc rand() uses the default 31-word additive-feedback random() state.
 static pthread_mutex_t random_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -178,9 +182,19 @@ static uint64_t guest_semaphore(Guest *g,const char *name,const uint64_t a[8]) {
 
 // glibc exposes its locale struct to libc++, including ctype tables at
 // offsets 0x68, 0x70 and 0x78. Darwin's locale_t has a different layout.
-static uint64_t guest_newlocale(Guest *g, const char *name) {
-    locale_t host=newlocale(LC_ALL_MASK,name ? name : "C",NULL);
-    if(!host){*(int *)(uintptr_t)g->errno_slot=linux_errno(errno);return 0;}
+static void guest_freelocale(Guest *g,uint64_t value);
+static locale_t host_locale(uint64_t value);
+// mask uses glibc's category bits (1 << LC_CTYPE=0, LC_NUMERIC=1, LC_TIME=2, LC_COLLATE=3,
+// LC_MONETARY=4, LC_MESSAGES=5). Categories outside the mask come from base, which is
+// consumed as with glibc, or from "C" when there is no base.
+static uint64_t guest_newlocale(Guest *g, uint64_t mask, const char *name, uint64_t base) {
+    static const int masks[]={LC_CTYPE_MASK,LC_NUMERIC_MASK,LC_TIME_MASK,LC_COLLATE_MASK,LC_MONETARY_MASK,LC_MESSAGES_MASK};
+    int host_mask=0;for(int i=0;i<6;++i)if(mask & (1u<<i))host_mask|=masks[i];
+    locale_t host_base=NULL;
+    if(base && base!=UINT64_MAX && host_locale(base)){host_base=duplocale(host_locale(base));if(!host_base){*(int *)(uintptr_t)g->errno_slot=12;return 0;}}
+    locale_t host=newlocale(host_mask,name ? name : "C",host_base);
+    if(!host){if(host_base)freelocale(host_base);*(int *)(uintptr_t)g->errno_slot=linux_errno(errno);return 0;}
+    if(base && base!=UINT64_MAX)guest_freelocale(g,base);
     uint8_t *locale = guest_malloc(g, 256);
     unsigned short *classes = guest_malloc(g, 384 * sizeof(*classes));
     int *lower = guest_malloc(g, 384 * sizeof(*lower));
@@ -410,6 +424,18 @@ static double linux_va_double(LinuxVaList *va) {
     return value;
 }
 
+// The import being dispatched on this thread, so host lookups can be cached in it.
+static __thread Import *current_import;
+
+static void *host_symbol(const char *name) {
+    Import *entry = current_import;
+    if (!entry || entry->name != name) return dlsym(RTLD_DEFAULT, name);
+    void *function = __atomic_load_n(&entry->host, __ATOMIC_ACQUIRE);
+    if (!function && (function = dlsym(RTLD_DEFAULT, name)))
+        __atomic_store_n(&entry->host, function, __ATOMIC_RELEASE);
+    return function;
+}
+
 // Convert the Linux AArch64 va_list to a Darwin variadic call through libffi.
 static int linux_vformat(Guest *g, const char *name, const uint64_t a[8], uint64_t *result) {
     unsigned fixed = 0, va_arg = 0, direct = 0;
@@ -455,6 +481,22 @@ static int linux_vformat(Guest *g, const char *name, const uint64_t a[8], uint64
         values[0].u=a[0];values[1].u=a[1];values[2].u=a[2];
     } else return 0;
     if (!format || (!direct && !a[va_arg])) return -1;
+    // glibc's %m prints strerror(errno); Darwin has no such conversion, so substitute it.
+    char errno_format[8192];
+    if (format != wide_format && strstr(format, "%m")) {
+        const char *message = strerror(host_errno(*(int *)(uintptr_t)g->errno_slot));
+        size_t used = 0;
+        for (const char *p = format; *p; ++p) {
+            if (used + 2 * strlen(message) + 3 >= sizeof errno_format) return -1;
+            if (p[0] == '%' && p[1] == '%') { errno_format[used++] = '%'; errno_format[used++] = '%'; ++p; }
+            else if (p[0] == '%' && p[1] == 'm') {
+                for (const char *m = message; *m; ++m) { if (*m == '%') errno_format[used++] = '%'; errno_format[used++] = *m; }
+                ++p;
+            } else errno_format[used++] = *p;
+        }
+        errno_format[used] = 0;
+        format = errno_format; values[fixed - 1].u = (uintptr_t)errno_format;
+    }
     if (g->trace) fprintf(stderr, "  Linux format: %s\n", format);
     LinuxVaList va;uint64_t gr[8];hv_simd_fp_uchar16_t vr[8];
     if(direct) {
@@ -500,9 +542,9 @@ static int linux_vformat(Guest *g, const char *name, const uint64_t a[8], uint64
     ffi_cif cif;
     if (ffi_prep_cif_var(&cif, FFI_DEFAULT_ABI, fixed, count, &ffi_type_sint32, types) != FFI_OK) return -1;
     ffi_sarg written = -1;
-    errno=host_errno(*(int *)(uintptr_t)g->errno_slot);
+    errno = errno_entry = host_errno(*(int *)(uintptr_t)g->errno_slot);
     ffi_call(&cif, FFI_FN(function), &written, arguments);
-    *(int *)(uintptr_t)g->errno_slot=linux_errno(errno);
+    store_errno(g);
     if (!strcmp(name, "__vasprintf_chk")) {
         if (written >= 0 && allocated) {
             void *copy = guest_malloc(g, (size_t)written + 1);
@@ -565,9 +607,9 @@ static int linux_c23_scan(Guest *g,const char *input,const char *format,LinuxVaL
             }
         }
         char spec[256];memcpy(spec,start,spec_length);memcpy(spec+spec_length,"%n",3);int used=-1;
-        errno=host_errno(*(int *)(uintptr_t)g->errno_slot);
+        errno = errno_entry = host_errno(*(int *)(uintptr_t)g->errno_slot);
         if(suppress)(void)sscanf(cursor,spec,&used);else (void)sscanf(cursor,spec,dest,&used);
-        *(int *)(uintptr_t)g->errno_slot=linux_errno(errno);
+        store_errno(g);
         if(used<0){const char *q=cursor;if(conversion!='c' && conversion!='[')while(isspace((unsigned char)*q))++q;
             *result=(uint64_t)(int64_t)(!*q && !assigned?-1:assigned);return 1;}
         cursor+=used;if(!suppress)++assigned;
@@ -603,8 +645,8 @@ static int linux_vscan(Guest *g,const char *name,const uint64_t a[8],uint64_t *r
     }
     for(unsigned i=0;i<count;++i)args[i]=&values[i];ffi_cif cif;ffi_sarg scanned=-1;
     if(ffi_prep_cif_var(&cif,FFI_DEFAULT_ABI,2,count,&ffi_type_sint32,types)!=FFI_OK)return -1;
-    errno=host_errno(*(int *)(uintptr_t)g->errno_slot);ffi_call(&cif,FFI_FN(sscanf),&scanned,args);
-    *(int *)(uintptr_t)g->errno_slot=linux_errno(errno);*result=(uint64_t)scanned;return 1;
+    errno = errno_entry = host_errno(*(int *)(uintptr_t)g->errno_slot);ffi_call(&cif,FFI_FN(sscanf),&scanned,args);
+    store_errno(g);*result=(uint64_t)scanned;return 1;
 }
 
 static int c23_integer(Guest *g,const char *name,const uint64_t a[8],uint64_t *result) {
@@ -637,14 +679,14 @@ static int c23_integer(Guest *g,const char *name,const uint64_t a[8],uint64_t *r
         } else *result=negative?0-(uint64_t)magnitude:(uint64_t)magnitude;
         return 1;
     }
-    errno=host_errno(*(int *)(uintptr_t)g->errno_slot);
+    errno = errno_entry = host_errno(*(int *)(uintptr_t)g->errno_slot);
     if(wide) *result=unsign?wcstoull((const wchar_t *)(uintptr_t)a[0],(wchar_t **)(uintptr_t)a[1],base):
                           (uint64_t)wcstoll((const wchar_t *)(uintptr_t)a[0],(wchar_t **)(uintptr_t)a[1],base);
     else if(use_locale)*result=unsign?strtoull_l((const char *)(uintptr_t)a[0],(char **)(uintptr_t)a[1],base,loc):
                                    (uint64_t)strtoll_l((const char *)(uintptr_t)a[0],(char **)(uintptr_t)a[1],base,loc);
     else *result=unsign?strtoull((const char *)(uintptr_t)a[0],(char **)(uintptr_t)a[1],base):
                         (uint64_t)strtoll((const char *)(uintptr_t)a[0],(char **)(uintptr_t)a[1],base);
-    *(int *)(uintptr_t)g->errno_slot=linux_errno(errno);return 1;
+    store_errno(g);return 1;
 }
 
 static int in_names(const char *name, const char *const *names) {
@@ -660,7 +702,7 @@ static int multibyte_call(Guest *g,const char *name,const uint64_t a[8],uint64_t
                    !strcmp(name,"mbsinit")?0:3;
     mbstate_t state={0};mbstate_t *host=NULL;
     if(a[index]){memcpy(&state,(void *)(uintptr_t)a[index],8);host=&state;}
-    errno=host_errno(*(int *)(uintptr_t)g->errno_slot);size_t value=0;
+    errno = errno_entry = host_errno(*(int *)(uintptr_t)g->errno_slot);size_t value=0;
     if(!strcmp(name,"mbrtowc"))value=mbrtowc((wchar_t *)(uintptr_t)a[0],(const char *)(uintptr_t)a[1],(size_t)a[2],host);
     else if(!strcmp(name,"mbrlen"))value=mbrlen((const char *)(uintptr_t)a[0],(size_t)a[1],host);
     else if(!strcmp(name,"wcrtomb"))value=wcrtomb((char *)(uintptr_t)a[0],(wchar_t)a[1],host);
@@ -669,7 +711,7 @@ static int multibyte_call(Guest *g,const char *name,const uint64_t a[8],uint64_t
     else if(!strcmp(name,"wcsrtombs"))value=wcsrtombs((char *)(uintptr_t)a[0],(const wchar_t **)(uintptr_t)a[1],(size_t)a[2],host);
     else if(!strcmp(name,"wcsnrtombs"))value=wcsnrtombs((char *)(uintptr_t)a[0],(const wchar_t **)(uintptr_t)a[1],(size_t)a[2],(size_t)a[3],host);
     else value=(size_t)mbsinit(host);
-    *(int *)(uintptr_t)g->errno_slot=linux_errno(errno);
+    store_errno(g);
     if(host){const unsigned char *bytes=(const unsigned char *)&state;
         for(size_t i=8;i<sizeof state;++i)if(bytes[i]){fprintf(stderr,"Unsupported multibyte state for %s\n",name);return -1;}
         memcpy((void *)(uintptr_t)a[index],&state,8);}
@@ -730,8 +772,8 @@ static int floating_call(Guest *g, const char *name, const uint64_t a[8], uint64
     float xf = 0, yf = 0, f = 0;
     memcpy(&x, &q0, sizeof x); memcpy(&y, &q1, sizeof y);
     memcpy(&xf, &q0, sizeof xf); memcpy(&yf, &q1, sizeof yf);
-    void *fn = dlsym(RTLD_DEFAULT, name);
-    errno = host_errno(*(int *)(uintptr_t)g->errno_slot);
+    void *fn = host_symbol(name);
+    errno = errno_entry = host_errno(*(int *)(uintptr_t)g->errno_slot);
     if (ud && strcmp(name, "nan")) d = ((double (*)(double))fn)(x);
     else if (bd) d = ((double (*)(double, double))fn)(x, y);
     else if (uf && strcmp(name, "nanf")) f = ((float (*)(float))fn)(xf);
@@ -744,14 +786,14 @@ static int floating_call(Guest *g, const char *name, const uint64_t a[8], uint64
     else if (!strcmp(name, "ldexpf")) f = ldexpf(xf, (int)a[0]);
     else if (!strcmp(name, "sincos")) { *(double *)(uintptr_t)a[0] = sin(x); *(double *)(uintptr_t)a[1] = cos(x); }
     else if (!strcmp(name, "sincosf")) { *(float *)(uintptr_t)a[0] = sinf(xf); *(float *)(uintptr_t)a[1] = cosf(xf); }
-    else if (!strcmp(name, "lrintf")) { *integer_result = (uint64_t)lrintf(xf); *(int *)(uintptr_t)g->errno_slot = linux_errno(errno); return 1; }
+    else if (!strcmp(name, "lrintf")) { *integer_result = (uint64_t)lrintf(xf); store_errno(g); return 1; }
     else if (!strcmp(name, "strtod")) d = strtod((const char *)(uintptr_t)a[0], (char **)(uintptr_t)a[1]);
     else if (!strcmp(name, "strtod_l")) d = strtod_l((const char *)(uintptr_t)a[0], (char **)(uintptr_t)a[1], host_locale(a[2]));
     else if (!strcmp(name, "strtof")) f = strtof((const char *)(uintptr_t)a[0], (char **)(uintptr_t)a[1]);
     else if (!strcmp(name, "strtof_l")) f = strtof_l((const char *)(uintptr_t)a[0], (char **)(uintptr_t)a[1], host_locale(a[2]));
     else if (!strcmp(name, "wcstod")) d = wcstod((const wchar_t *)(uintptr_t)a[0],(wchar_t **)(uintptr_t)a[1]);
     else if (!strcmp(name, "wcstof")) f = wcstof((const wchar_t *)(uintptr_t)a[0],(wchar_t **)(uintptr_t)a[1]);
-    *(int *)(uintptr_t)g->errno_slot = linux_errno(errno);
+    store_errno(g);
     if (uf || bf || !strcmp(name, "ldexpf") || !strcmp(name, "strtof") || !strcmp(name, "strtof_l") || !strcmp(name, "wcstof"))
         memcpy(&result, &f, sizeof f);
     else memcpy(&result, &d, sizeof d);
@@ -875,13 +917,18 @@ static void *guest_thread_main(void *opaque) {
     pthread_mutex_unlock(&thread->lock);
     if (!error) {
         uint64_t args[8] = {thread->argument};
-        if (guest_call(g, thread->entry, args, &result))
-            fprintf(stderr, "Guest worker %u failed\n", g->tid);
+        if (guest_call(g, thread->entry, args, &result)) {
+            // Other engine threads may be waiting for this one's work and would never be
+            // woken; end the worker so the caller sees the failure at once.
+            fprintf(stderr, "Guest worker %u failed; stopping the engine\n", g->tid);
+            fflush(stderr); _exit(139);
+        }
     } else fprintf(stderr, "Could not initialize guest worker %u\n", g->tid);
     if(!error && !__atomic_load_n(&shared->broken,__ATOMIC_ACQUIRE))guest_run_thread_destructors(g);
     if(g->thread_vcpu_created)hv_vcpu_destroy(g->vcpu);
     guest_free(g,g->stack);guest_free(g,g->tls);guest_free(g,(void *)(uintptr_t)g->errno_slot);
-    guest_free(g,(void *)(uintptr_t)g->strerror_buffer);guest_free(g,(void *)(uintptr_t)g->setlocale_buffer);
+    guest_free(g,(void *)(uintptr_t)g->strerror_buffer);
+    for(unsigned i=0;i<g->locale_name_count;++i)guest_free(g,(void *)(uintptr_t)g->locale_names[i]);g->locale_name_count=0;
     guest_free(g,(void *)(uintptr_t)g->localeconv_buffer);
     if(g->default_locale)guest_freelocale(g,g->default_locale);
     __atomic_sub_fetch(&shared->active_threads, 1, __ATOMIC_RELEASE);
@@ -898,67 +945,84 @@ static int guest_compare(void *opaque, const void *left, const void *right) {
     return (int32_t)result;
 }
 
+// Waiters are kept per address in a fixed hash table. An entry exists only while
+// someone waits on its address, so long-running workers don't accumulate entries.
 typedef struct Futex {
     uint64_t address;
-    pthread_mutex_t mutex;
     pthread_cond_t condition;
     unsigned waiters;
     struct Futex *next;
 } Futex;
-static pthread_mutex_t futex_table_lock = PTHREAD_MUTEX_INITIALIZER;
-static Futex *futexes;
-
-static Futex *get_futex(uint64_t address) {
-    pthread_mutex_lock(&futex_table_lock);
-    Futex *f = futexes;
+typedef struct { pthread_mutex_t lock; Futex *head; } FutexBucket;
+static FutexBucket futex_buckets[256];
+static pthread_once_t futex_once = PTHREAD_ONCE_INIT;
+static void futex_init(void) { for (size_t i = 0; i < 256; ++i) pthread_mutex_init(&futex_buckets[i].lock, NULL); }
+static FutexBucket *futex_bucket(uint64_t address) {
+    pthread_once(&futex_once, futex_init);
+    return &futex_buckets[(address >> 2 ^ address >> 10) & 255];
+}
+static Futex *futex_find(FutexBucket *b, uint64_t address) {
+    Futex *f = b->head;
     while (f && f->address != address) f = f->next;
-    if (!f) {
-        f = calloc(1, sizeof(*f));
-        if (f) {
-            f->address = address;
-            pthread_mutex_init(&f->mutex, NULL);
-            pthread_cond_init(&f->condition, NULL);
-            f->next = futexes; futexes = f;
-        }
-    }
-    pthread_mutex_unlock(&futex_table_lock);
     return f;
 }
 
+enum { FUTEX_SPIN = 2000 }; // about 10 µs on Apple silicon
+
 static uint64_t guest_futex(Guest *g, const uint64_t a[8], int *failed) {
-    Futex *f = get_futex(a[1]);
-    if (!f) { *(int *)(uintptr_t)g->errno_slot = 12; return UINT64_MAX; }
     unsigned op = (unsigned)a[2] & 0x7f;
-    pthread_mutex_lock(&f->mutex);
+    // The engine's thread pool hands off work items of a few tens of microseconds.
+    // Sleeping in the kernel for each one costs more than the work, so watch the
+    // word briefly first; a change means the wait would have returned EAGAIN anyway.
+    if (op == 0 && !a[4]) {
+        const uint32_t *word = (const uint32_t *)(uintptr_t)a[1];
+        for (int i = 0; i < FUTEX_SPIN; ++i) {
+            if (__atomic_load_n(word, __ATOMIC_ACQUIRE) != (uint32_t)a[3]) {
+                *(int *)(uintptr_t)g->errno_slot = 11; return UINT64_MAX; // EAGAIN
+            }
+            __asm__ volatile("isb" ::: "memory");
+        }
+    }
+    FutexBucket *b = futex_bucket(a[1]);
     if (op == 0) { // FUTEX_WAIT[_PRIVATE]
+        pthread_mutex_lock(&b->lock);
         if (__atomic_load_n((uint32_t *)(uintptr_t)a[1], __ATOMIC_SEQ_CST) != (uint32_t)a[3]) {
-            pthread_mutex_unlock(&f->mutex);
+            pthread_mutex_unlock(&b->lock);
             *(int *)(uintptr_t)g->errno_slot = 11; return UINT64_MAX; // EAGAIN
+        }
+        Futex *f = futex_find(b, a[1]);
+        if (!f) {
+            f = calloc(1, sizeof *f);
+            if (!f) { pthread_mutex_unlock(&b->lock); *(int *)(uintptr_t)g->errno_slot = 12; return UINT64_MAX; }
+            f->address = a[1]; pthread_cond_init(&f->condition, NULL); f->next = b->head; b->head = f;
         }
         ++f->waiters;
         int error;
-        if (a[4]) {
+        if (a[4]) { // relative timeout, measured on the monotonic clock as on Linux
             const struct timespec *relative = (const struct timespec *)(uintptr_t)a[4];
-            struct timespec deadline;
-            clock_gettime(CLOCK_REALTIME, &deadline);
-            deadline.tv_sec += relative->tv_sec;
-            deadline.tv_nsec += relative->tv_nsec;
-            if (deadline.tv_nsec >= 1000000000) { ++deadline.tv_sec; deadline.tv_nsec -= 1000000000; }
-            error = pthread_cond_timedwait(&f->condition, &f->mutex, &deadline);
-        } else error = pthread_cond_wait(&f->condition, &f->mutex);
-        --f->waiters;
-        pthread_mutex_unlock(&f->mutex);
+            error = pthread_cond_timedwait_relative_np(&f->condition, &b->lock, relative);
+        } else error = pthread_cond_wait(&f->condition, &b->lock);
+        if (!--f->waiters) {
+            Futex **link = &b->head;
+            while (*link != f) link = &(*link)->next;
+            *link = f->next; pthread_cond_destroy(&f->condition); free(f);
+        }
+        pthread_mutex_unlock(&b->lock);
         if (error) { *(int *)(uintptr_t)g->errno_slot = linux_errno(error); return UINT64_MAX; }
         return 0;
     }
     if (op == 1) { // FUTEX_WAKE[_PRIVATE]
-        unsigned count = f->waiters < a[3] ? f->waiters : (unsigned)a[3];
-        if (count == f->waiters) pthread_cond_broadcast(&f->condition);
-        else for (unsigned i = 0; i < count; ++i) pthread_cond_signal(&f->condition);
-        pthread_mutex_unlock(&f->mutex);
+        pthread_mutex_lock(&b->lock);
+        Futex *f = futex_find(b, a[1]);
+        unsigned count = 0;
+        if (f) {
+            count = f->waiters < a[3] ? f->waiters : (unsigned)a[3];
+            if (count == f->waiters) pthread_cond_broadcast(&f->condition);
+            else for (unsigned i = 0; i < count; ++i) pthread_cond_signal(&f->condition);
+        }
+        pthread_mutex_unlock(&b->lock);
         return count;
     }
-    pthread_mutex_unlock(&f->mutex);
     fprintf(stderr, "Unimplemented Linux futex operation %#x\n", (unsigned)a[2]);
     *failed = 1; return 0;
 }
@@ -1087,13 +1151,21 @@ static uint64_t invoke(Guest *g, const char *name, const uint64_t a[8], int *fai
         if (a[0] >= sizeof(categories) / sizeof(categories[0])) return 0;
         const char *value = setlocale(categories[a[0]], (const char *)(uintptr_t)a[1]);
         if (!value) return 0;
+        if (a[1]) { guest_free(g,(void *)(uintptr_t)g->localeconv_buffer); g->localeconv_buffer = 0; }
+        // Callers commonly save the returned name and pass it back later, so each distinct
+        // name gets one copy that lives as long as the guest.
+        for (unsigned i = 0; i < g->locale_name_count; ++i)
+            if (!strcmp((const char *)(uintptr_t)g->locale_names[i], value)) return g->locale_names[i];
+        if (g->locale_name_count >= sizeof g->locale_names / sizeof g->locale_names[0]) return 0;
         size_t length = strlen(value) + 1;
-        guest_free(g,(void *)(uintptr_t)g->setlocale_buffer);
-        char *copy = guest_malloc(g, length);g->setlocale_buffer=(uintptr_t)copy;
-        if (copy) memcpy(copy, value, length);
-        return (uintptr_t)copy;
+        char *copy = guest_malloc(g, length);
+        if (!copy) return 0;
+        memcpy(copy, value, length);
+        return g->locale_names[g->locale_name_count++] = (uintptr_t)copy;
     }
     if (!strcmp(name,"localeconv")) {
+        // glibc returns the same buffer until the locale changes; callers may keep it.
+        if(g->localeconv_buffer && g->localeconv_locale==g->current_locale)return g->localeconv_buffer;
         struct lconv *host=localeconv();
         const char *strings[]={host->decimal_point,host->thousands_sep,host->grouping,host->int_curr_symbol,
             host->currency_symbol,host->mon_decimal_point,host->mon_thousands_sep,host->mon_grouping,host->positive_sign,host->negative_sign};
@@ -1101,11 +1173,15 @@ static uint64_t invoke(Guest *g, const char *name, const uint64_t a[8], int *fai
         uint8_t *out=guest_malloc(g,size);if(!out){*(int *)(uintptr_t)g->errno_slot=12;return 0;}memset(out,0,size);
         char *at=(char *)out+96;
         for(size_t i=0;i<10;++i){const char *s=strings[i]?strings[i]:"";size_t n=strlen(s)+1;
-            ((uint64_t *)out)[i]=(uintptr_t)at;memcpy(at,s,n);at+=n;}
+            ((uint64_t *)out)[i]=(uintptr_t)at;memcpy(at,s,n);
+            if(i==2 || i==7)for(char *c=at;*c;++c)if(*c==CHAR_MAX)*c=(char)255; // grouping, mon_grouping
+            at+=n;}
         char attrs[]={host->int_frac_digits,host->frac_digits,host->p_cs_precedes,host->p_sep_by_space,host->n_cs_precedes,
             host->n_sep_by_space,host->p_sign_posn,host->n_sign_posn,host->int_p_cs_precedes,host->int_p_sep_by_space,
             host->int_n_cs_precedes,host->int_n_sep_by_space,host->int_p_sign_posn,host->int_n_sign_posn};
-        memcpy(out+80,attrs,sizeof attrs);guest_free(g,(void *)(uintptr_t)g->localeconv_buffer);g->localeconv_buffer=(uintptr_t)out;return (uintptr_t)out;
+        for(size_t i=0;i<sizeof attrs;++i)if(attrs[i]==CHAR_MAX)attrs[i]=(char)255;
+        memcpy(out+80,attrs,sizeof attrs);guest_free(g,(void *)(uintptr_t)g->localeconv_buffer);
+        g->localeconv_buffer=(uintptr_t)out;g->localeconv_locale=g->current_locale;return (uintptr_t)out;
     }
     if (!strcmp(name, "getauxval") || !strcmp(name, "__getauxval"))
         return a[0] == 16 ? 3 : 0; // AArch64 baseline FP and SIMD only.
@@ -1171,7 +1247,7 @@ static uint64_t invoke(Guest *g, const char *name, const uint64_t a[8], int *fai
         out[1]=limits.rlim_max==RLIM_INFINITY?UINT64_MAX:limits.rlim_max;return 0;
     }
     if (!strcmp(name,"getcwd") || !strcmp(name,"realpath") || !strcmp(name,"__realpath_chk")) {
-        errno=host_errno(*(int *)(uintptr_t)g->errno_slot);char *value=NULL;
+        errno = errno_entry = host_errno(*(int *)(uintptr_t)g->errno_slot);char *value=NULL;
         if(!strcmp(name,"getcwd"))value=getcwd((char *)(uintptr_t)a[0],(size_t)a[1]);
         else if(!strcmp(name,"__realpath_chk")) {
             char *resolved=realpath((const char *)(uintptr_t)a[0],NULL);
@@ -1186,7 +1262,7 @@ static uint64_t invoke(Guest *g, const char *name, const uint64_t a[8], int *fai
     }
     if (!strcmp(name,"pread64") || !strcmp(name,"__pread64_chk") || !strcmp(name,"__read_chk") || !strcmp(name,"__readlink_chk") ||
         !strcmp(name,"__fread_chk") || !strcmp(name,"__fgets_chk")) {
-        errno=host_errno(*(int *)(uintptr_t)g->errno_slot);uint64_t result=0;int overflow=0;
+        errno = errno_entry = host_errno(*(int *)(uintptr_t)g->errno_slot);uint64_t result=0;int overflow=0;
         if(!strcmp(name,"__read_chk")) {overflow=a[2]>a[3];if(!overflow)result=(uint64_t)(int64_t)read((int)a[0],(void *)(uintptr_t)a[1],(size_t)a[2]);}
         else if(!strcmp(name,"__readlink_chk")){overflow=a[2]>a[3];if(!overflow)result=(uint64_t)(int64_t)readlink((const char *)(uintptr_t)a[0],(char *)(uintptr_t)a[1],(size_t)a[2]);}
         else if(!strcmp(name,"pread64") || !strcmp(name,"__pread64_chk")) {
@@ -1305,10 +1381,12 @@ static uint64_t invoke(Guest *g, const char *name, const uint64_t a[8], int *fai
             pthread_mutex_unlock(&thread->lock);pthread_cond_destroy(&thread->cond);pthread_mutex_destroy(&thread->lock);
             free(thread); return linux_errno(error);
         }
+        // Like glibc, store the handle before the new thread runs guest code: threads
+        // may read their own handle from the caller's variable.
+        *(uint64_t *)(uintptr_t)a[0] = (uintptr_t)handle;
         while(!thread->ready)pthread_cond_wait(&thread->cond,&thread->lock);
         error=thread->error;thread->accepted=1;pthread_cond_signal(&thread->cond);pthread_mutex_unlock(&thread->lock);
         if(error){pthread_join(handle,NULL);return 11;}
-        *(uint64_t *)(uintptr_t)a[0] = (uintptr_t)handle;
         return 0;
     }
     if (!strcmp(name, "qsort")) {
@@ -1360,7 +1438,7 @@ static uint64_t invoke(Guest *g, const char *name, const uint64_t a[8], int *fai
     if (!strcmp(name, "ftello64")) name = "ftello";
     else if (!strcmp(name, "fseeko64")) name = "fseeko";
     else if (!strcmp(name, "lseek64")) name = "lseek";
-    if (!strcmp(name, "newlocale")) return guest_newlocale(g, (const char *)(uintptr_t)a[1]);
+    if (!strcmp(name, "newlocale")) return guest_newlocale(g, a[0], (const char *)(uintptr_t)a[1], a[2]);
     if (!strcmp(name, "freelocale")) {guest_freelocale(g,a[0]);return 0;}
     if (!strcmp(name, "uselocale")) {
         uint64_t previous = g->current_locale;
@@ -1374,7 +1452,7 @@ static uint64_t invoke(Guest *g, const char *name, const uint64_t a[8], int *fai
     if (!strcmp(name, "__ctype_get_mb_cur_max")) return MB_CUR_MAX;
     if (!strcmp(name, "__ctype_b_loc") || !strcmp(name, "__ctype_tolower_loc") ||
         !strcmp(name, "__ctype_toupper_loc")) {
-        if (!g->default_locale) g->default_locale = guest_newlocale(g, "C");
+        if (!g->default_locale) g->default_locale = guest_newlocale(g, 0x3f, "C", 0);
         if (!g->default_locale) return 0;
         return g->default_locale + (!strcmp(name, "__ctype_b_loc") ? 0x68 :
                                     !strcmp(name, "__ctype_tolower_loc") ? 0x70 : 0x78);
@@ -1389,7 +1467,10 @@ static uint64_t invoke(Guest *g, const char *name, const uint64_t a[8], int *fai
     }
     if (!strcmp(name, "pthread_mutex_lock") || !strcmp(name, "pthread_mutex_trylock") ||
         !strcmp(name, "pthread_mutex_unlock") || !strcmp(name, "pthread_mutex_destroy")) {
-        pthread_mutex_t *mutex = guest_mutex(a[0], 0);
+        // A statically initialised mutex is created on first use; glibc keeps its type
+        // (PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP etc.) in __kind at offset 16.
+        int kind = a[0] ? *(int *)(uintptr_t)(a[0] + 16) & 0x7f : 0;
+        pthread_mutex_t *mutex = guest_mutex(a[0], kind <= 3 ? kind : 0);
         if (!mutex) return EINVAL;
         if (!strcmp(name, "pthread_mutex_lock")) return linux_errno(pthread_mutex_lock(mutex));
         if (!strcmp(name, "pthread_mutex_trylock")) return linux_errno(pthread_mutex_trylock(mutex));
@@ -1445,7 +1526,7 @@ static uint64_t invoke(Guest *g, const char *name, const uint64_t a[8], int *fai
     }
     if (!strcmp(name, "strtoll_l") || !strcmp(name, "__isoc23_strtoll_l") ||
         !strcmp(name, "strtoull_l") || !strcmp(name, "__isoc23_strtoull_l")) {
-        errno = host_errno(*(int *)(uintptr_t)g->errno_slot);
+        errno = errno_entry = host_errno(*(int *)(uintptr_t)g->errno_slot);
         uint64_t result = strstr(name, "strtoull") ?
             strtoull_l((const char *)(uintptr_t)a[0], (char **)(uintptr_t)a[1], (int)a[2], host_locale(a[3])) :
             (uint64_t)strtoll_l((const char *)(uintptr_t)a[0], (char **)(uintptr_t)a[1], (int)a[2], host_locale(a[3]));
@@ -1483,6 +1564,11 @@ static uint64_t invoke(Guest *g, const char *name, const uint64_t a[8], int *fai
     int locale_index=in_names(name,locale_one)?1:in_names(name,locale_two)?2:in_names(name,locale_three)?3:
                      !strcmp(name,"strftime_l")?4:-1;
     if(locale_index>=0)translated[locale_index]=(uintptr_t)host_locale(a[locale_index]);
+    // SEEK_DATA and SEEK_HOLE are 3 and 4 on Linux but 4 and 3 on Darwin.
+    if(!strcmp(name,"lseek") && (a[2]==3 || a[2]==4))translated[2]=a[2]==3 ? SEEK_DATA : SEEK_HOLE;
+    // pthread_key_t is 32 bits on Linux; the upper half of the register is not defined.
+    if(!strcmp(name,"pthread_getspecific") || !strcmp(name,"pthread_setspecific") || !strcmp(name,"pthread_key_delete"))
+        translated[0]=(uint32_t)a[0];
     // Only imports with the same argument, result, and pointed-to layout on both ABIs
     // reach Darwin through this path. Everything else needs an explicit shim.
     static const char *const identical[] = {
@@ -1495,7 +1581,7 @@ static uint64_t invoke(Guest *g, const char *name, const uint64_t a[8], int *fai
         "pthread_setspecific","pthread_key_delete","nanosleep","sched_yield",NULL
     };
     if(locale_index<0 && !in_names(name,identical)){fprintf(stderr,"Unsupported Linux import: %s\n",name);*failed=1;return 0;}
-    void *function = dlsym(RTLD_DEFAULT, name);
+    void *function = host_symbol(name);
     if (!function) {
         fprintf(stderr, "Unimplemented Linux import: %s\n", name);
         *failed = 1; return 0;
@@ -1503,40 +1589,60 @@ static uint64_t invoke(Guest *g, const char *name, const uint64_t a[8], int *fai
     GenericFunction f = (GenericFunction)function;
     // The guest may clear its own errno immediately before calling libc.
     // Carry that value into Darwin's thread-local errno, not a stale host one.
-    errno = host_errno(*(int *)(uintptr_t)g->errno_slot);
+    errno = errno_entry = host_errno(*(int *)(uintptr_t)g->errno_slot);
     uint64_t value = f(translated[0],translated[1],translated[2],translated[3],translated[4],translated[5],translated[6],translated[7]);
-    *(int *)(uintptr_t)g->errno_slot = linux_errno(errno);
+    store_errno(g);
     if (!strcmp(name, "pthread_join") || !strcmp(name, "pthread_detach") || !strcmp(name, "pthread_setspecific") || !strcmp(name, "pthread_key_delete"))
         value = (uint64_t)linux_errno((int)value);
     return value;
 }
 
+static void trace_hostcall(Guest *g, const char *name, const uint64_t args[8]);
+
+// Import families, in the order guest_hostcall tries them. Once an import has been
+// handled, its family is remembered so later calls skip the name checks.
+enum { KIND_UNKNOWN, KIND_FORMAT, KIND_SCAN, KIND_C23, KIND_MULTIBYTE, KIND_QUAD, KIND_FLOATING, KIND_GENERIC };
+
 int guest_hostcall(Guest *g, unsigned id, const uint64_t args[8], uint64_t *result) {
-    Guest *shared=g->master;pthread_mutex_lock(&shared->import_lock);
-    if (!id || id > shared->import_count) {pthread_mutex_unlock(&shared->import_lock);
+    Guest *shared=g->master;
+    if (!id || id > __atomic_load_n(&shared->import_count, __ATOMIC_ACQUIRE)) {
         fprintf(stderr, "Unknown guest host-call %u\n", id); return -1;}
-    const char *name = shared->imports[id - 1].name;pthread_mutex_unlock(&shared->import_lock);
-    if (g->master->profile) __atomic_add_fetch(&g->master->hostcall_counts[id - 1], 1, __ATOMIC_RELAXED);
+    Import *entry = &shared->imports[id - 1];
+    const char *name = entry->name;
+    current_import = entry;
+    if (shared->profile) __atomic_add_fetch(&shared->hostcall_counts[id - 1], 1, __ATOMIC_RELAXED);
+    if (g->trace) trace_hostcall(g, name, args);
+    int failed = 0, r = 0;
+    switch (__atomic_load_n(&entry->kind, __ATOMIC_RELAXED)) {
+    case KIND_UNKNOWN: break;
+    case KIND_FORMAT: r = linux_vformat(g, name, args, result); return r < 0 ? -1 : 0;
+    case KIND_SCAN: r = linux_vscan(g, name, args, result); return r < 0 ? -1 : 0;
+    case KIND_C23: c23_integer(g, name, args, result); return 0;
+    case KIND_MULTIBYTE: r = multibyte_call(g, name, args, result); return r < 0 ? -1 : 0;
+    case KIND_QUAD: r = quad_call(g, name, args); return r < 0 ? -1 : 0;
+    case KIND_FLOATING: r = floating_call(g, name, args, result); return r < 0 ? -1 : 0;
+    default: *result = invoke(g, name, args, &failed); return failed ? -1 : 0;
+    }
+    unsigned char kind = KIND_GENERIC;
+    if ((r = linux_vformat(g, name, args, result))) kind = KIND_FORMAT;
+    else if ((r = linux_vscan(g, name, args, result))) kind = KIND_SCAN;
+    else if ((r = c23_integer(g, name, args, result))) kind = KIND_C23;
+    else if ((r = multibyte_call(g, name, args, result))) kind = KIND_MULTIBYTE;
+    else if ((r = quad_call(g, name, args))) kind = KIND_QUAD;
+    else if ((r = floating_call(g, name, args, result))) kind = KIND_FLOATING;
+    else *result = invoke(g, name, args, &failed);
+    __atomic_store_n(&entry->kind, kind, __ATOMIC_RELAXED);
+    if (kind == KIND_GENERIC) return failed ? -1 : 0;
+    return r < 0 ? -1 : 0;
+}
+
+static void trace_hostcall(Guest *g, const char *name, const uint64_t args[8]) {
     static const char *const noisy[] = {"malloc", "free", "calloc", "realloc", "memcpy", "memmove", "memset",
         "strlen", "strnlen", "memcmp", "memchr", "bcmp", "pthread_mutex_lock", "pthread_mutex_unlock",
         "pthread_getspecific", "__memcpy_chk", "__memmove_chk", "__memset_chk", "rand", "aligned_alloc",
         "posix_memalign", "clock_gettime", "__errno_location", "log2", "cos", NULL};
     int routine_syscall = !strcmp(name, "syscall") && (args[0] == 98 || args[0] == 178);
-    if (g->trace && (g->trace > 1 || (!in_names(name, noisy) && !routine_syscall))) fprintf(stderr, "hostcall %s(%#llx, %#llx, %#llx)\n", name,
+    if (g->trace > 1 || (!in_names(name, noisy) && !routine_syscall)) fprintf(stderr, "hostcall %s(%#llx, %#llx, %#llx)\n", name,
                           (unsigned long long)args[0], (unsigned long long)args[1],
                           (unsigned long long)args[2]);
-    int failed = 0;
-    int formatted = linux_vformat(g, name, args, result);
-    if (formatted) return formatted < 0 ? -1 : 0;
-    int scanned=linux_vscan(g,name,args,result);
-    if(scanned)return scanned<0?-1:0;
-    if(c23_integer(g,name,args,result))return 0;
-    int multibyte=multibyte_call(g,name,args,result);
-    if(multibyte)return multibyte<0?-1:0;
-    int quad=quad_call(g,name,args);
-    if(quad)return quad<0?-1:0;
-    int floating = floating_call(g, name, args, result);
-    if (floating) return floating < 0 ? -1 : 0;
-    *result = invoke(g, name, args, &failed);
-    return failed ? -1 : 0;
 }

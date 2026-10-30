@@ -29,6 +29,8 @@ typedef struct {
 typedef struct {
     char *name;
     uint64_t address;
+    void *host;          // host function, looked up on first call
+    unsigned char kind;  // which shim family handles this import; 0 until known
 } Import;
 
 typedef struct { char name[64], gender[24]; } Speaker;
@@ -72,7 +74,9 @@ typedef struct Guest {
     uint64_t stack_guard, stdin_slot, stdout_slot, stderr_slot, environ_slot, argv;
     uint64_t tzname_slot, timezone_slot;
     uint64_t errno_slot;
-    uint64_t strerror_buffer, setlocale_buffer, localeconv_buffer;
+    uint64_t strerror_buffer, localeconv_buffer, localeconv_locale;
+    uint64_t locale_names[16]; // names returned by setlocale
+    unsigned locale_name_count;
     uint64_t default_locale, current_locale;
     uint64_t free_bins[512];
     void *mappings;

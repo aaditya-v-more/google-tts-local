@@ -312,9 +312,9 @@ uint64_t guest_import(Guest *g, const char *name) {
         stub[1] = 0xd65f03c0u; // ret
         __builtin___clear_cache((char *)stub,(char *)(stub+2));
     }
-    shared->imports[shared->import_count].name = copy;
-    shared->imports[shared->import_count].address = (uintptr_t)stub;
-    ++shared->import_count;
+    shared->imports[shared->import_count] = (Import){.name = copy, .address = (uintptr_t)stub};
+    // guest_hostcall reads the table without the lock.
+    __atomic_store_n(&shared->import_count, shared->import_count + 1, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&shared->import_lock);
     return (uintptr_t)stub;
 }

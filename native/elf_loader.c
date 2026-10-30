@@ -187,7 +187,6 @@ static int load_object(Guest *g, const char *path) {
             g->tls_used = (g->tls_used + obj->tls_align - 1) & ~(obj->tls_align - 1);
             obj->tls_offset = g->tls_used;
             if (obj->tls_memsz > 65536 - g->tls_used) { munmap(file, length); return -1; }
-            memcpy(g->tls + obj->tls_offset, obj->base + obj->tls_image, (size_t)obj->tls_filesz);
             g->tls_used += obj->tls_memsz;
         }
     }
@@ -335,6 +334,12 @@ int guest_load_objects(Guest *g) {
             relocate_rela(g, obj, obj->jmprel, obj->jmprel_size) || relocate_relr(obj)) {
             fprintf(stderr, "Relocation failed: %s\n", obj->path); return -1;
         }
+    }
+    // The main thread's TLS starts as a copy of each object's template, taken after
+    // relocation so pointers in .tdata are final (later threads copy g->tls).
+    for (size_t i = 0; i < g->object_count; ++i) {
+        ElfObject *obj = &g->objects[i];
+        if (obj->tls_filesz) memcpy(g->tls + obj->tls_offset, obj->base + obj->tls_image, (size_t)obj->tls_filesz);
     }
     if (g->native_mode) for (size_t i = 0; i < g->object_count; ++i)
         if (protect_native_object(&g->objects[i])) return -1;

@@ -79,10 +79,11 @@ void guest_native_heap_free(Guest *g, void *pointer) {
     if (p < base + 16 || p - base >= shared->arena_size || (p & 15)) __builtin_trap();
     lock_arena(shared);
     uint64_t *header = (uint64_t *)pointer - 2;
-    if (header[1] != UINT64_C(0x4754545348454150)) __builtin_trap();
-    header[1] = 0;
     size_t capacity = 0, bin = allocation_class((size_t)header[0], &capacity);
-    if (bin >= 512) __builtin_trap();
+    // A trap unwinds out of the engine call; release the lock first so the worker
+    // reports the fault instead of every other thread spinning on it.
+    if (header[1] != UINT64_C(0x4754545348454150) || bin >= 512) { unlock_arena(shared); __builtin_trap(); }
+    header[1] = 0;
     *(uint64_t *)pointer = shared->free_bins[bin];
     shared->free_bins[bin] = (uintptr_t)header;
     unlock_arena(shared);
