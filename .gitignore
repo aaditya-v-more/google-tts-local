@@ -16,3 +16,5 @@ native/REPORT-*.md
 native/QUESTIONS.md
 native/watch.sh
 native/analyze-x18*.py
+windows/*.exe
+windows/*.o
