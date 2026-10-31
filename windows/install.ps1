@@ -30,7 +30,7 @@ if ($Uninstall) {
     $kept = Split-PathList (Get-UserPath) | Where-Object { $_.TrimEnd('\') -ne $Prefix.TrimEnd('\') }
     Set-UserPath ($kept -join ';')
     if (Test-Path $Prefix) { Remove-Item -Recurse -Force $Prefix }
-    Write-Host "Removed $Prefix. Downloaded data is kept in $env:LOCALAPPDATA\google-tts-local."
+    Write-Host "Removed $Prefix. Downloaded voices are kept; delete the data folder to remove them."
     return
 }
 
