@@ -83,6 +83,21 @@ static int file_exists(const char *path) {
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+// Compares the files themselves, so a path through a junction (Scoop's "current")
+// matches the real one.
+static int same_file(const wchar_t *a, const wchar_t *b) {
+    BY_HANDLE_FILE_INFORMATION ia, ib;
+    HANDLE ha = CreateFileW(a, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    HANDLE hb = CreateFileW(b, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    int same = ha != INVALID_HANDLE_VALUE && hb != INVALID_HANDLE_VALUE &&
+               GetFileInformationByHandle(ha, &ia) && GetFileInformationByHandle(hb, &ib) &&
+               ia.dwVolumeSerialNumber == ib.dwVolumeSerialNumber &&
+               ia.nFileIndexHigh == ib.nFileIndexHigh && ia.nFileIndexLow == ib.nFileIndexLow;
+    if (ha != INVALID_HANDLE_VALUE) CloseHandle(ha);
+    if (hb != INVALID_HANDLE_VALUE) CloseHandle(hb);
+    return same;
+}
+
 static void ensure_dir(const char *path) {
     char *copy = format_string("%s", path);
     for (char *p = copy + 1; *p; ++p) if (*p == '/' || *p == '\\') {
@@ -384,6 +399,16 @@ static int worker_start(Worker *w, char *error, size_t error_size) {
     CloseHandle(child_in); CloseHandle(child_out);
     if (null_err != INVALID_HANDLE_VALUE) CloseHandle(null_err);
     if (!ok) { worker_stop(w); snprintf(error, error_size, "Cannot start the engine worker"); return -1; }
+    // Workers die with the process that started them, so stopping the server leaves none behind.
+    static HANDLE job;
+    if (!job) {
+        HANDLE created = CreateJobObjectW(NULL, NULL);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (created) SetInformationJobObject(created, JobObjectExtendedLimitInformation, &limits, sizeof limits);
+        if (created && InterlockedCompareExchangePointer(&job, created, NULL)) CloseHandle(created);
+    }
+    if (job) AssignProcessToJobObject(job, pi.hProcess);
     CloseHandle(pi.hThread);
     w->process = pi.hProcess;
     w->buffered = w->offset = 0;
@@ -1167,7 +1192,7 @@ static int service(const char *action, const char *host, int port) {
             HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pids[i]);
             if (!p) continue;
             wchar_t image[32768]; DWORD size = 32768;
-            if (QueryFullProcessImageNameW(p, 0, image, &size) && !_wcsicmp(image, wquiet)) TerminateProcess(p, 0);
+            if (QueryFullProcessImageNameW(p, 0, image, &size) && (!_wcsicmp(image, wquiet) || same_file(image, wquiet))) TerminateProcess(p, 0);
             CloseHandle(p);
         }
         fprintf(stderr, "Removed the sign-in entry and stopped the background server. Downloaded data is kept in %s\n", data_dir);

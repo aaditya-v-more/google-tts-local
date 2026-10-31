@@ -3,7 +3,7 @@ ifeq ($(origin CC),default)
 CC := gcc
 endif
 CFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
-VERSION := $(shell cat ../native/VERSION 2>/dev/null || echo 0.4.0)
+VERSION := $(shell cat VERSION 2>/dev/null || cat ../native/VERSION 2>/dev/null || echo 0.4.0)
 SOURCES := gtts.c speech.c elf.c libc.c format.c json.c
 HEADERS := engine.h speech.h json.h
 LIBS := -lws2_32 -lbcrypt -lsynchronization -lpsapi -lshell32

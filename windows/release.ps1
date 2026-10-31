@@ -2,7 +2,10 @@
 param([string]$Msys = 'C:\msys64')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot
-$version = (Get-Content (Join-Path $root 'native\VERSION')).Trim()
+# windows\VERSION, when present, lets a Windows-only fix ship without changing the Mac version.
+$versionFile = Join-Path $PSScriptRoot 'VERSION'
+if (-not (Test-Path $versionFile)) { $versionFile = Join-Path $root 'native\VERSION' }
+$version = (Get-Content $versionFile).Trim()
 
 $env:MSYSTEM = 'UCRT64'
 $env:CHERE_INVOKING = '1'
