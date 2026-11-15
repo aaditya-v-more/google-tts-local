@@ -1,8 +1,8 @@
 class GoogleTtsLocal < Formula
   desc "Run Google's on-device text-to-speech voices locally on Apple Silicon"
   homepage "https://github.com/aaditya-v-more/google-tts-local"
-  url "https://github.com/aaditya-v-more/google-tts-local/releases/download/v0.4.0/google-tts-local-0.4.0.tar.gz"
-  sha256 "edc49ce1cb4c25863fb6a73871c6872489844b731d33e3fe352b59c6fc10a37c"
+  url "https://github.com/aaditya-v-more/google-tts-local/releases/download/v0.4.1/google-tts-local-0.4.1.tar.gz"
+  sha256 "47d7977d3f81e8df283f3234d51b104a3485cb5863862f9eaa28970ef14976c0"
   license all_of: ["MIT", "BSD-3-Clause"]
 
   depends_on macos: :ventura
