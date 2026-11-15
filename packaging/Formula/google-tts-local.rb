@@ -45,7 +45,7 @@ class GoogleTtsLocal < Formula
   end
 
   test do
-    assert_match "gtts 0.4.0", shell_output("#{bin}/gtts --version")
+    assert_match "gtts 0.4.1", shell_output("#{bin}/gtts --version")
     assert_match "Usage: gtts speak", shell_output("#{bin}/gtts speak --help")
     assert_match "Run gtts fetch", shell_output("#{bin}/gtts voices --data-dir #{testpath}/missing 2>&1", 1)
     system "/usr/bin/codesign", "--verify", "--strict", libexec/"google-tts-local/gtts-engine"

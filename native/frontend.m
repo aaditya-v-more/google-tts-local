@@ -22,7 +22,7 @@
 #include <unistd.h>
 extern char **environ;
 #ifndef GTTS_VERSION
-#define GTTS_VERSION "0.4.0"
+#define GTTS_VERSION "0.4.1"
 #endif
 
 static NSString *const packageURL = @"https://storage.googleapis.com/chromeos-localmirror/distfiles/googletts-35.3.tar.xz";

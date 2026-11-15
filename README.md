@@ -234,11 +234,11 @@ and takes text-to-speech plugins. To put these voices in its voice menu, after
 gtts-earmark install
 ```
 
-On Windows, from the release folder or the install folder:
+On Windows, run `earmark.ps1` from this repository's `windows` folder (Windows
+releases after 0.4.1 also include it, and `install.ps1 -Earmark` runs it):
 
 ```powershell
 .\earmark.ps1
-# or, when installing: .\install.ps1 -Fetch -Earmark
 ```
 
 This writes one file, `google-tts-local.json`, into Earmark's plugins folder
