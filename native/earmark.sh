@@ -9,7 +9,8 @@ Usage: gtts-earmark install|uninstall|status [options]
   uninstall  Remove them from Earmark again; gtts and its voices stay installed
   status     Say whether they are registered, and whether the server is running
 Options: --app NAME  --port PORT
-Defaults: app Earmark (a development build is "Earmark Dev"), port 5591.
+Defaults: app Earmark (a development build is "Earmark Dev"; Lingveil takes the same
+plugins: --app Lingveil), port 5591.
 On a Mac, Earmark starts the gtts-service LaunchAgent itself the first time one of the
 voices is used; run gtts fetch first. On Linux, run the server yourself (see the README).
 HELP

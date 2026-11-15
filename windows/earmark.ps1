@@ -14,7 +14,7 @@ first time one of the voices is used; run gtts fetch first.
 .\earmark.ps1 -Status
 #>
 param(
-    [string]$App = 'Earmark',  # a development build is "Earmark Dev"
+    [string]$App = 'Earmark',  # a development build is "Earmark Dev"; Lingveil takes the same plugins
     [int]$Port = 5591,
     [string]$Gtts,             # gtts.exe; default: next to this script, else the installed one
     [switch]$Uninstall,        # remove the voices from Earmark; gtts stays installed
