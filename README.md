@@ -256,13 +256,13 @@ gtts-earmark uninstall   # remove the voices from Earmark; gtts stays installed
 ```
 
 `--app "Earmark Dev"` (`-App` on Windows) registers with a development build of
-Earmark, and `--port` (`-Port`) matches a server on another port.
+Earmark, and `--port` (`-Port`) matches a server on another port. Earmark asks
+the server for one sentence at a time with `POST /speak` and the reading speed as
+`rate`, so the voices keep their clarity at 3× and above.
 
 **Lingveil** (Mac and Windows) takes the same
 plugins: `gtts-earmark install --app Lingveil` (`.\earmark.ps1 -App Lingveil` on
-Windows) puts the voices in its read-aloud voices too. Earmark asks
-the server for one sentence at a time with `POST /speak` and the reading speed as
-`rate`, so the voices keep their clarity at 3× and above.
+Windows) puts the voices in its read-aloud voices too.
 
 ## Docker
 
