@@ -9,12 +9,14 @@ users and no administrator rights are needed.
 
 .EXAMPLE
 .\install.ps1 -Fetch -StartAtLogin
+.\install.ps1 -Fetch -Earmark
 .\install.ps1 -Uninstall
 #>
 param(
     [string]$Prefix = (Join-Path $env:LOCALAPPDATA 'Programs\google-tts-local'),
     [switch]$Fetch,          # download the engine and voices after installing
     [switch]$StartAtLogin,   # run gtts serve in the background when you sign in
+    [switch]$Earmark,        # add the voices to Earmark's voice menu (earmark.ps1)
     [switch]$Uninstall       # remove the program; downloaded voices are kept
 )
 $ErrorActionPreference = 'Stop'
@@ -27,6 +29,8 @@ function Split-PathList([string]$list) { if ($list) { $list -split ';' | Where-O
 if ($Uninstall) {
     $gtts = Join-Path $Prefix 'gtts.exe'
     if (Test-Path $gtts) { & $gtts service uninstall }
+    $register = Join-Path $Prefix 'earmark.ps1'
+    if (Test-Path $register) { & $register -Uninstall }
     $kept = Split-PathList (Get-UserPath) | Where-Object { $_.TrimEnd('\') -ne $Prefix.TrimEnd('\') }
     Set-UserPath ($kept -join ';')
     if (Test-Path $Prefix) { Remove-Item -Recurse -Force $Prefix }
@@ -43,7 +47,7 @@ $wasRunning = [bool]$running
 if ($running) { $running | Stop-Process -Force; Start-Sleep -Milliseconds 300 }
 
 New-Item -ItemType Directory -Force $Prefix | Out-Null
-foreach ($file in 'gtts.exe', 'gttsw.exe', 'LICENSE', 'NOTICE.md') {
+foreach ($file in 'gtts.exe', 'gttsw.exe', 'earmark.ps1', 'LICENSE', 'NOTICE.md') {
     $from = Join-Path $source $file
     if (Test-Path $from) { Copy-Item -Force $from $Prefix }
 }
@@ -61,4 +65,5 @@ Write-Host "Installed $(& $gtts --version) to $Prefix"
 
 if ($Fetch) { & $gtts fetch; if ($LASTEXITCODE) { exit $LASTEXITCODE } }
 if ($StartAtLogin -or $wasRunning) { & $gtts service install; if ($LASTEXITCODE) { exit $LASTEXITCODE } }
+if ($Earmark) { & (Join-Path $Prefix 'earmark.ps1') -Gtts $gtts }
 if (-not $Fetch) { Write-Host 'Next: gtts fetch' }

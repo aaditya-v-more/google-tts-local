@@ -4,7 +4,7 @@ set -eu
 usage() {
     cat <<'HELP'
 Usage: PREFIX=~/.local ./native/install.sh [--uninstall]
-Build, ad-hoc sign, and install gtts and gtts-service for the current user.
+Build, ad-hoc sign, and install gtts, gtts-service and gtts-earmark for the current user.
 PREFIX defaults to $HOME/.local. --uninstall removes only the installed files,
 not downloaded voices, data, or a running LaunchAgent.
 HELP
@@ -24,7 +24,7 @@ LIBEXEC="$PREFIX/libexec/google-tts-local"
 LICENSES="$PREFIX/share/google-tts-local/licenses"
 
 if [ "${1-}" = --uninstall ]; then
-    rm -f "$BIN/gtts" "$BIN/gtts-service" "$LIBEXEC/gtts-engine" \
+    rm -f "$BIN/gtts" "$BIN/gtts-service" "$BIN/gtts-earmark" "$LIBEXEC/gtts-engine" \
         "$LIBEXEC/libgtts-shim.dylib" "$LIBEXEC/gtts-macho-convert.py" \
         "$LICENSES/NOTICE.md" "$LICENSES/GCC-14-COPYRIGHT.txt" "$LICENSES/GPL-3.0.txt" "$LICENSES/ZSTD-BSD.txt"
     rmdir "$LICENSES" "$PREFIX/share/google-tts-local" "$LIBEXEC" 2>/dev/null || true
@@ -51,11 +51,12 @@ install -m 755 "$SCRIPT_DIR/build/gtts-engine" "$LIBEXEC/gtts-engine"
 install -m 755 "$SCRIPT_DIR/build/libgtts-shim.dylib" "$LIBEXEC/libgtts-shim.dylib"
 install -m 644 "$SCRIPT_DIR/build/gtts-macho-convert.py" "$LIBEXEC/gtts-macho-convert.py"
 install -m 755 "$SCRIPT_DIR/launchagent.sh" "$BIN/gtts-service"
+install -m 755 "$SCRIPT_DIR/earmark.sh" "$BIN/gtts-earmark"
 install -m 644 "$SCRIPT_DIR/licenses/NOTICE.md" "$SCRIPT_DIR/licenses/GCC-14-COPYRIGHT.txt" "$SCRIPT_DIR/licenses/GPL-3.0.txt" "$SCRIPT_DIR/licenses/ZSTD-BSD.txt" "$LICENSES/"
 TMPDIR="$SCRIPT_DIR/tmp" codesign --force --sign - --entitlements "$SCRIPT_DIR/hypervisor.entitlements" "$LIBEXEC/gtts-engine"
 TMPDIR="$SCRIPT_DIR/tmp" codesign --force --sign - "$BIN/gtts"
 codesign --verify --strict "$LIBEXEC/gtts-engine"
 codesign --verify --strict "$LIBEXEC/libgtts-shim.dylib"
 codesign --verify --strict "$BIN/gtts"
-printf 'Installed %s and %s.\n' "$BIN/gtts" "$BIN/gtts-service"
+printf 'Installed %s, %s and %s.\n' "$BIN/gtts" "$BIN/gtts-service" "$BIN/gtts-earmark"
 printf 'Add %s to PATH if needed, then run: gtts fetch\n' "$BIN"

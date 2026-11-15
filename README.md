@@ -25,6 +25,8 @@
   &nbsp;·&nbsp;
   <a href="#speaking"><b>Speaking</b></a>
   &nbsp;·&nbsp;
+  <a href="#use-with-earmark"><b>Earmark</b></a>
+  &nbsp;·&nbsp;
   <a href="#docker"><b>Docker</b></a>
   &nbsp;·&nbsp;
   <a href="https://github.com/aaditya-v-more/google-tts-local/releases"><b>Releases</b></a>
@@ -222,8 +224,41 @@ gtts-service install
 gtts-service uninstall   # stops the service; keeps downloaded data
 ```
 
-[Earmark](https://github.com/aaditya-v-more/earmark), an EPUB reader for the
-Mac, lists these voices in its voice menu when this server is running.
+## Use with Earmark
+
+[Earmark](https://tinkerfold.com/earmark) reads EPUB, PDF and text books aloud,
+and takes text-to-speech plugins. To put these voices in its voice menu, after
+`gtts fetch`:
+
+```sh
+gtts-earmark install
+```
+
+On Windows, from the release folder or the install folder:
+
+```powershell
+.\earmark.ps1
+# or, when installing: .\install.ps1 -Fetch -Earmark
+```
+
+This writes one file, `google-tts-local.json`, into Earmark's plugins folder
+(`~/Library/Application Support/Earmark/Plugins` on a Mac,
+`%APPDATA%\Earmark\Plugins` on Windows, `~/.config/Earmark/Plugins` on Linux).
+The voices appear under **Google** in Earmark's voice menu, filtered to the
+book's language, when Earmark next comes to the front. The first time one of
+them is chosen, Earmark starts the server (`gtts-service install` on a Mac,
+`gtts service install` on Windows), so it also runs at login from then on. On
+Linux, start the Docker server yourself (see below) before choosing a voice.
+
+```sh
+gtts-earmark status      # registered? server running?
+gtts-earmark uninstall   # remove the voices from Earmark; gtts stays installed
+```
+
+`--app "Earmark Dev"` (`-App` on Windows) registers with a development build of
+Earmark, and `--port` (`-Port`) matches a server on another port. Earmark asks
+the server for one sentence at a time with `POST /speak` and the reading speed as
+`rate`, so the voices keep their clarity at 3× and above.
 
 ## Docker
 

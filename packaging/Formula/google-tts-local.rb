@@ -14,6 +14,7 @@ class GoogleTtsLocal < Formula
     system "make", "-C", "native", "all"
     bin.install "native/build/gtts-native" => "gtts"
     bin.install "native/launchagent.sh" => "gtts-service"
+    bin.install "native/earmark.sh" => "gtts-earmark"
     (libexec/"google-tts-local").install "native/build/gtts-engine"
     (libexec/"google-tts-local").install "native/build/libgtts-shim.dylib"
     (libexec/"google-tts-local").install "native/build/gtts-macho-convert.py"
@@ -34,6 +35,9 @@ class GoogleTtsLocal < Formula
       To run the HTTP server as a user LaunchAgent:
         gtts-service install
 
+      To add the voices to Earmark's voice menu:
+        gtts-earmark install
+
       The engine helper is ad-hoc signed and is not notarized.
       macOS 26.4 or later can run the engine in-process; older versions use
       Hypervisor.framework.
@@ -47,5 +51,6 @@ class GoogleTtsLocal < Formula
     system "/usr/bin/codesign", "--verify", "--strict", libexec/"google-tts-local/gtts-engine"
     system "/usr/bin/codesign", "--verify", "--strict", libexec/"google-tts-local/libgtts-shim.dylib"
     system "/usr/bin/codesign", "--verify", "--strict", bin/"gtts"
+    assert_match "Usage: gtts-earmark", shell_output("#{bin}/gtts-earmark --help")
   end
 end

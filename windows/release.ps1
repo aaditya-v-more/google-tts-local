@@ -19,7 +19,7 @@ $name = "google-tts-local-$version-windows-x64"
 $stage = Join-Path $root "dist\$name"
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force $stage | Out-Null
-foreach ($file in 'gtts.exe', 'gttsw.exe', 'install.ps1', 'NOTICE.md') { Copy-Item (Join-Path $PSScriptRoot $file) $stage }
+foreach ($file in 'gtts.exe', 'gttsw.exe', 'install.ps1', 'earmark.ps1', 'NOTICE.md') { Copy-Item (Join-Path $PSScriptRoot $file) $stage }
 Copy-Item (Join-Path $root 'LICENSE') $stage
 Copy-Item -Recurse (Join-Path $PSScriptRoot 'licenses') $stage
 $zip = Join-Path $root "dist\$name.zip"
